@@ -1,0 +1,33 @@
+# Rust build artifacts
+/target
+Cargo.lock
+
+# Editor and IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.local
+
+# Logs
+*.log
+
+# Test coverage
+coverage/
+
+# Misc
+*.tmp
+*.prof*
+*.rlib
+
+.serena
+CLAUDE.md
+AGENTS.md
