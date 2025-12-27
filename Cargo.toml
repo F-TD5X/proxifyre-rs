@@ -17,14 +17,21 @@ ipnetwork = "0.20"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 smoltcp = { version = "0.11", default-features = false, features = ["proto-ipv4", "proto-ipv6", "std", "medium-ethernet", "socket-udp"] }
-tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 windows = { version = "0.62.2", features = [
   "Win32_Foundation",
   "Win32_NetworkManagement_IpHelper",
   "Win32_Networking_WinSock",
   "Win32_Security",
   "Win32_System_ProcessStatus",
-  "Win32_System_SystemServices",
+  "Win32_System_SystemInformation",
+  "Win32_System_Memory",
   "Win32_System_Threading",
 ] }
 socket2 = "0.5"
+crossterm = "0.28"
+ratatui = "0.28"
+unicode-width = "0.1"
+humantime = "2.1"
+log = "0.4"
+chrono = "0.4"

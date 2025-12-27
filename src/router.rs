@@ -1,6 +1,7 @@
 use crate::proxy::{Socks5Dialer, TransparentProxy};
 use crate::windows::process::ProcessLookup;
 use anyhow::{anyhow, Context, Result};
+use log::{error, info};
 use ndisapi::{
     DataLinkLayerFilter, DirectionFlags, EthRequest, EthRequestMut, FilterFlags, FilterLayerFlags,
     IntermediateBuffer, IpAddressV4, IpAddressV4Union, IpAddressV6, IpAddressV6Union, IpSubnetV4,
@@ -18,9 +19,10 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, NO_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
     CancelMibChangeNotify2, GetBestInterface, NotifyIpInterfaceChange, MIB_IPINTERFACE_ROW,
@@ -37,6 +39,12 @@ const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 const MAX_STATIC_FILTERS: usize = 256;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProxyDirection {
+    ToProxy,
+    FromProxy,
+}
+
 #[derive(Clone, Debug)]
 struct TcpPortMapping {
     dst_ip: IpAddr,
@@ -49,7 +57,10 @@ struct UdpPortMapping {
     dst_ip: IpAddr,
     dst_port: u16,
     proxy_port: u16,
+    last_active: Instant,
 }
+
+const UDP_TIMEOUT_SECS: u64 = 60;
 
 pub struct SocksLocalRouter {
     adapter_name: Arc<Mutex<String>>,
@@ -65,6 +76,9 @@ pub struct SocksLocalRouter {
     packet_thread: Mutex<Option<JoinHandle<()>>>,
     notify_handle: Mutex<Option<usize>>,
     notify_context: Mutex<Option<usize>>,
+    pub bytes_sent: Arc<AtomicU64>,
+    pub bytes_received: Arc<AtomicU64>,
+    pub start_time: Instant,
 }
 
 impl SocksLocalRouter {
@@ -72,7 +86,7 @@ impl SocksLocalRouter {
         let adapter_name = select_best_adapter_name(driver)?;
         let friendly = Ndisapi::get_friendly_adapter_name(&adapter_name)
             .unwrap_or_else(|_| adapter_name.clone());
-        println!("Using adapter: {}", friendly);
+        info!("Using adapter: {}", friendly);
 
         let mut filters = Vec::new();
         filters.push(build_icmp_pass_filter());
@@ -91,6 +105,9 @@ impl SocksLocalRouter {
             packet_thread: Mutex::new(None),
             notify_handle: Mutex::new(None),
             notify_context: Mutex::new(None),
+            bytes_sent: Arc::new(AtomicU64::new(0)),
+            bytes_received: Arc::new(AtomicU64::new(0)),
+            start_time: Instant::now(),
         })
     }
 
@@ -208,7 +225,7 @@ impl SocksLocalRouter {
 
         let thread = thread::spawn(move || {
             if let Err(err) = run_packet_loop(DRIVER_NAME, adapter_name, shutdown, restart, router) {
-                eprintln!("packet loop exited with error: {err}");
+                error!("packet loop exited with error: {err}");
             }
         });
 
@@ -349,7 +366,7 @@ impl SocksLocalRouter {
             unsafe {
                 let _ = Arc::from_raw(ctx as *const SocksLocalRouter);
             }
-            eprintln!("NotifyIpInterfaceChange failed: {status:?}");
+            error!("NotifyIpInterfaceChange failed: {status:?}");
             return;
         }
 
@@ -379,36 +396,36 @@ impl SocksLocalRouter {
         if *name != new_name {
             let friendly = Ndisapi::get_friendly_adapter_name(&new_name)
                 .unwrap_or_else(|_| new_name.clone());
-            println!("Detected default interface: {}", friendly);
+            info!("Detected default interface: {}", friendly);
             *name = new_name;
             return Ok(true);
         }
         Ok(false)
     }
 
-    fn process_packet(&self, packet: &mut IntermediateBuffer) -> bool {
+    fn process_packet(&self, packet: &mut IntermediateBuffer) -> Option<ProxyDirection> {
         let length = packet.get_length() as usize;
         if length < 14 {
-            return false;
+            return None;
         }
         let buffer = packet.get_data_mut();
 
         let mut frame = match EthernetFrame::<&mut [u8]>::new_checked(&mut buffer[..length]) {
             Ok(frame) => frame,
-            Err(_) => return false,
+            Err(_) => return None,
         };
 
         match frame.ethertype() {
             EthernetProtocol::Ipv4 => self.process_ipv4(&mut frame),
             EthernetProtocol::Ipv6 => self.process_ipv6(&mut frame),
-            _ => false,
+            _ => None,
         }
     }
 
-    fn process_ipv4(&self, frame: &mut EthernetFrame<&mut [u8]>) -> bool {
+    fn process_ipv4(&self, frame: &mut EthernetFrame<&mut [u8]>) -> Option<ProxyDirection> {
         let mut ipv4 = match Ipv4Packet::new_checked(frame.payload_mut()) {
             Ok(pkt) => pkt,
-            Err(_) => return false,
+            Err(_) => return None,
         };
 
         let src_ip = ipv4.src_addr();
@@ -416,15 +433,15 @@ impl SocksLocalRouter {
 
         match ipv4.next_header() {
             IpProtocol::Tcp => {
-                let redirected = {
+                let direction = {
                     let mut tcp = match TcpPacket::new_checked(ipv4.payload_mut()) {
                         Ok(pkt) => pkt,
-                        Err(_) => return false,
+                        Err(_) => return None,
                     };
                     self.process_tcp_v4_payload(src_ip, dst_ip, &mut tcp)
                 };
 
-                if redirected {
+                if direction.is_some() {
                     swap_ipv4(&mut ipv4);
                     let src = ipv4.src_addr();
                     let dst = ipv4.dst_addr();
@@ -434,22 +451,22 @@ impl SocksLocalRouter {
                     ipv4.fill_checksum();
                     swap_mac(frame);
                 }
-                redirected
+                direction
             }
             IpProtocol::Udp => {
                 if dst_ip.is_multicast() || dst_ip.is_broadcast() {
-                    return false;
+                    return None;
                 }
 
-                let redirected = {
+                let direction = {
                     let mut udp = match UdpPacket::new_checked(ipv4.payload_mut()) {
                         Ok(pkt) => pkt,
-                        Err(_) => return false,
+                        Err(_) => return None,
                     };
                     self.process_udp_v4_payload(src_ip, dst_ip, &mut udp)
                 };
 
-                if redirected {
+                if direction.is_some() {
                     swap_ipv4(&mut ipv4);
                     let src = ipv4.src_addr();
                     let dst = ipv4.dst_addr();
@@ -459,16 +476,16 @@ impl SocksLocalRouter {
                     ipv4.fill_checksum();
                     swap_mac(frame);
                 }
-                redirected
+                direction
             }
-            _ => false,
+            _ => None,
         }
     }
 
-    fn process_ipv6(&self, frame: &mut EthernetFrame<&mut [u8]>) -> bool {
+    fn process_ipv6(&self, frame: &mut EthernetFrame<&mut [u8]>) -> Option<ProxyDirection> {
         let mut ipv6 = match Ipv6Packet::new_checked(frame.payload_mut()) {
             Ok(pkt) => pkt,
-            Err(_) => return false,
+            Err(_) => return None,
         };
 
         let src_ip = ipv6.src_addr();
@@ -476,15 +493,15 @@ impl SocksLocalRouter {
 
         match ipv6.next_header() {
             IpProtocol::Tcp => {
-                let redirected = {
+                let direction = {
                     let mut tcp = match TcpPacket::new_checked(ipv6.payload_mut()) {
                         Ok(pkt) => pkt,
-                        Err(_) => return false,
+                        Err(_) => return None,
                     };
                     self.process_tcp_v6_payload(src_ip, dst_ip, &mut tcp)
                 };
 
-                if redirected {
+                if direction.is_some() {
                     swap_ipv6(&mut ipv6);
                     let src = ipv6.src_addr();
                     let dst = ipv6.dst_addr();
@@ -493,22 +510,22 @@ impl SocksLocalRouter {
                     }
                     swap_mac(frame);
                 }
-                redirected
+                direction
             }
             IpProtocol::Udp => {
                 if dst_ip.is_multicast() {
-                    return false;
+                    return None;
                 }
 
-                let redirected = {
+                let direction = {
                     let mut udp = match UdpPacket::new_checked(ipv6.payload_mut()) {
                         Ok(pkt) => pkt,
-                        Err(_) => return false,
+                        Err(_) => return None,
                     };
                     self.process_udp_v6_payload(src_ip, dst_ip, &mut udp)
                 };
 
-                if redirected {
+                if direction.is_some() {
                     swap_ipv6(&mut ipv6);
                     let src = ipv6.src_addr();
                     let dst = ipv6.dst_addr();
@@ -517,9 +534,9 @@ impl SocksLocalRouter {
                     }
                     swap_mac(frame);
                 }
-                redirected
+                direction
             }
-            _ => false,
+            _ => None,
         }
     }
 
@@ -528,7 +545,7 @@ impl SocksLocalRouter {
         src_ip: Ipv4Address,
         dst_ip: Ipv4Address,
         tcp: &mut TcpPacket<&mut [u8]>,
-    ) -> bool {
+    ) -> Option<ProxyDirection> {
         let src_ip_std = IpAddr::V4(Ipv4Addr::from(src_ip));
         let dst_ip_std = IpAddr::V4(Ipv4Addr::from(dst_ip));
         let src_port = tcp.src_port();
@@ -553,7 +570,7 @@ impl SocksLocalRouter {
                     });
                     redirected = true;
                     let process_label = format_process_label(&path);
-                    println!(
+                    info!(
                         "[TCP] [PROXY] {} {} -> {} (redirect to {})",
                         process_label, src, dst, proxy_port
                     );
@@ -565,7 +582,7 @@ impl SocksLocalRouter {
             if let Some(entry) = map.get(&key).cloned() {
                 if tcp.rst() || tcp.fin() {
                     map.remove(&key);
-                    println!("[TCP] {} -> {} (closed)", src, dst);
+                    info!("[TCP] {} -> {} (closed)", src, dst);
                 }
                 proxy_port = entry.proxy_port;
                 redirected = true;
@@ -574,7 +591,7 @@ impl SocksLocalRouter {
 
         if redirected {
             tcp.set_dst_port(proxy_port);
-            return true;
+            return Some(ProxyDirection::ToProxy);
         }
 
         if self.is_tcp_proxy_port(src_port) {
@@ -583,14 +600,14 @@ impl SocksLocalRouter {
             if let Some(entry) = map.get(&key).cloned() {
                 if tcp.rst() || tcp.fin() {
                     map.remove(&key);
-                    println!("[TCP] {} -> {} (closed)", src, dst);
+                    info!("[TCP] {} -> {} (closed)", src, dst);
                 }
                 tcp.set_src_port(entry.dst_port);
-                return true;
+                return Some(ProxyDirection::FromProxy);
             }
         }
 
-        false
+        None
     }
 
     fn process_tcp_v6_payload(
@@ -598,7 +615,7 @@ impl SocksLocalRouter {
         src_ip: Ipv6Address,
         dst_ip: Ipv6Address,
         tcp: &mut TcpPacket<&mut [u8]>,
-    ) -> bool {
+    ) -> Option<ProxyDirection> {
         let src_ip_std = IpAddr::V6(Ipv6Addr::from(src_ip));
         let dst_ip_std = IpAddr::V6(Ipv6Addr::from(dst_ip));
         let src_port = tcp.src_port();
@@ -623,7 +640,7 @@ impl SocksLocalRouter {
                     });
                     redirected = true;
                     let process_label = format_process_label(&path);
-                    println!(
+                    info!(
                         "[TCPv6] [PROXY] {} {} -> {} (redirect to {})",
                         process_label, src, dst, proxy_port
                     );
@@ -635,7 +652,7 @@ impl SocksLocalRouter {
             if let Some(entry) = map.get(&key).cloned() {
                 if tcp.rst() || tcp.fin() {
                     map.remove(&key);
-                    println!("[TCPv6] {} -> {} (closed)", src, dst);
+                    info!("[TCPv6] {} -> {} (closed)", src, dst);
                 }
                 proxy_port = entry.proxy_port;
                 redirected = true;
@@ -644,7 +661,7 @@ impl SocksLocalRouter {
 
         if redirected {
             tcp.set_dst_port(proxy_port);
-            return true;
+            return Some(ProxyDirection::ToProxy);
         }
 
         if self.is_tcp_proxy_port(src_port) {
@@ -653,14 +670,14 @@ impl SocksLocalRouter {
             if let Some(entry) = map.get(&key).cloned() {
                 if tcp.rst() || tcp.fin() {
                     map.remove(&key);
-                    println!("[TCPv6] {} -> {} (closed)", src, dst);
+                    info!("[TCPv6] {} -> {} (closed)", src, dst);
                 }
                 tcp.set_src_port(entry.dst_port);
-                return true;
+                return Some(ProxyDirection::FromProxy);
             }
         }
 
-        false
+        None
     }
 
     fn process_udp_v4_payload(
@@ -668,7 +685,7 @@ impl SocksLocalRouter {
         src_ip: Ipv4Address,
         dst_ip: Ipv4Address,
         udp: &mut UdpPacket<&mut [u8]>,
-    ) -> bool {
+    ) -> Option<ProxyDirection> {
         let src_ip_std = IpAddr::V4(Ipv4Addr::from(src_ip));
         let dst_ip_std = IpAddr::V4(Ipv4Addr::from(dst_ip));
         let src_port = udp.src_port();
@@ -679,6 +696,7 @@ impl SocksLocalRouter {
 
         let mut redirected = false;
         let mut proxy_port = 0u16;
+        let now = Instant::now();
 
         let key = (dst_ip_std, src_ip_std, src_port);
         {
@@ -687,8 +705,11 @@ impl SocksLocalRouter {
                 if entry.dst_port == dst_port {
                     redirected = true;
                     proxy_port = entry.proxy_port;
+                    if let Some(e) = map.get_mut(&key) {
+                        e.last_active = now;
+                    }
                 } else {
-                    return false;
+                    return None;
                 }
             } else if let Ok(path) = self.process_lookup.find_process_path(true, src, dst) {
                 proxy_port = self.get_proxy_port_udp(&path, false);
@@ -699,11 +720,12 @@ impl SocksLocalRouter {
                             dst_ip: dst_ip_std,
                             dst_port,
                             proxy_port,
+                            last_active: now,
                         },
                     );
                     redirected = true;
                     let process_label = format_process_label(&path);
-                    println!(
+                    info!(
                         "[UDP] [PROXY] {} {} -> {} (redirect to {})",
                         process_label, src, dst, proxy_port
                     );
@@ -713,7 +735,7 @@ impl SocksLocalRouter {
 
         if redirected {
             udp.set_dst_port(proxy_port);
-            return true;
+            return Some(ProxyDirection::ToProxy);
         }
 
         if self.is_udp_proxy_port(src_port) {
@@ -721,11 +743,11 @@ impl SocksLocalRouter {
             let map = self.udp_endpoints.lock().unwrap();
             if let Some(entry) = map.get(&key).cloned() {
                 udp.set_src_port(entry.dst_port);
-                return true;
+                return Some(ProxyDirection::FromProxy);
             }
         }
 
-        false
+        None
     }
 
     fn process_udp_v6_payload(
@@ -733,7 +755,7 @@ impl SocksLocalRouter {
         src_ip: Ipv6Address,
         dst_ip: Ipv6Address,
         udp: &mut UdpPacket<&mut [u8]>,
-    ) -> bool {
+    ) -> Option<ProxyDirection> {
         let src_ip_std = IpAddr::V6(Ipv6Addr::from(src_ip));
         let dst_ip_std = IpAddr::V6(Ipv6Addr::from(dst_ip));
         let src_port = udp.src_port();
@@ -744,6 +766,7 @@ impl SocksLocalRouter {
 
         let mut redirected = false;
         let mut proxy_port = 0u16;
+        let now = Instant::now();
 
         let key = (dst_ip_std, src_ip_std, src_port);
         {
@@ -752,8 +775,11 @@ impl SocksLocalRouter {
                 if entry.dst_port == dst_port {
                     redirected = true;
                     proxy_port = entry.proxy_port;
+                    if let Some(e) = map.get_mut(&key) {
+                        e.last_active = now;
+                    }
                 } else {
-                    return false;
+                    return None;
                 }
             } else if let Ok(path) = self.process_lookup.find_process_path(true, src, dst) {
                 proxy_port = self.get_proxy_port_udp(&path, true);
@@ -764,11 +790,12 @@ impl SocksLocalRouter {
                             dst_ip: dst_ip_std,
                             dst_port,
                             proxy_port,
+                            last_active: now,
                         },
                     );
                     redirected = true;
                     let process_label = format_process_label(&path);
-                    println!(
+                    info!(
                         "[UDPv6] [PROXY] {} {} -> {} (redirect to {})",
                         process_label, src, dst, proxy_port
                     );
@@ -778,7 +805,7 @@ impl SocksLocalRouter {
 
         if redirected {
             udp.set_dst_port(proxy_port);
-            return true;
+            return Some(ProxyDirection::ToProxy);
         }
 
         if self.is_udp_proxy_port(src_port) {
@@ -786,11 +813,40 @@ impl SocksLocalRouter {
             let map = self.udp_endpoints.lock().unwrap();
             if let Some(entry) = map.get(&key).cloned() {
                 udp.set_src_port(entry.dst_port);
-                return true;
+                return Some(ProxyDirection::FromProxy);
             }
         }
 
-        false
+        None
+    }
+
+    fn cleanup_stale_udp_endpoints(&self) {
+        let timeout = Duration::from_secs(UDP_TIMEOUT_SECS);
+        let now = Instant::now();
+        let mut map = self.udp_endpoints.lock().unwrap();
+        map.retain(|_, entry| now.duration_since(entry.last_active) < timeout);
+    }
+}
+
+impl SocksLocalRouter {
+    pub fn get_tcp_connection_count(&self) -> usize {
+        self.tcp_connections.lock().unwrap().len()
+    }
+
+    pub fn get_udp_connection_count(&self) -> usize {
+        self.udp_endpoints.lock().unwrap().len()
+    }
+
+    pub fn get_bytes_sent(&self) -> u64 {
+        self.bytes_sent.load(Ordering::Relaxed)
+    }
+
+    pub fn get_bytes_received(&self) -> u64 {
+        self.bytes_received.load(Ordering::Relaxed)
+    }
+
+    pub fn get_running_time(&self) -> Duration {
+        self.start_time.elapsed()
     }
 }
 
@@ -810,7 +866,7 @@ unsafe extern "system" fn ip_interface_changed_callback(
         }
         Ok(false) => {}
         Err(err) => {
-            eprintln!("Failed to refresh adapter name: {err}");
+            error!("Failed to refresh adapter name: {err}");
         }
     }
 }
@@ -1053,7 +1109,7 @@ fn run_packet_loop(
         let adapter_handle = match find_adapter_handle(&driver, &adapter_name) {
             Ok(handle) => handle,
             Err(err) => {
-                eprintln!("adapter not found ({adapter_name}): {err}");
+                error!("adapter not found ({adapter_name}): {err}");
                 if shutdown.load(Ordering::Relaxed) {
                     return Ok(());
                 }
@@ -1067,6 +1123,7 @@ fn run_packet_loop(
         driver.set_adapter_mode(adapter_handle, FilterFlags::MSTCP_FLAG_SENT_RECEIVE_TUNNEL)?;
 
         let mut packet = IntermediateBuffer::default();
+        let mut cleanup_counter = 0u32;
 
         while !shutdown.load(Ordering::Relaxed) {
             if restart.swap(false, Ordering::Relaxed) {
@@ -1084,10 +1141,23 @@ fn run_packet_loop(
                     break;
                 }
 
-                let redirected = router.process_packet(&mut packet);
+                let proxy_direction = router.process_packet(&mut packet);
                 let direction = packet.get_device_flags();
                 let is_send = direction.contains(DirectionFlags::PACKET_FLAG_ON_SEND);
+                let redirected = proxy_direction.is_some();
                 let send_to_adapter = if redirected { !is_send } else { is_send };
+
+                let length = packet.get_length() as u64;
+                if let Some(proxy_direction) = proxy_direction {
+                    match proxy_direction {
+                        ProxyDirection::ToProxy => {
+                            router.bytes_sent.fetch_add(length, Ordering::Relaxed);
+                        }
+                        ProxyDirection::FromProxy => {
+                            router.bytes_received.fetch_add(length, Ordering::Relaxed);
+                        }
+                    }
+                }
 
                 let mut write_request = EthRequest::new(adapter_handle);
                 write_request.set_packet(&packet);
@@ -1097,6 +1167,12 @@ fn run_packet_loop(
                 } else {
                     let _ = driver.send_packet_to_mstcp(&write_request);
                 }
+            }
+
+            cleanup_counter += 1;
+            if cleanup_counter >= 20 {
+                cleanup_counter = 0;
+                router.cleanup_stale_udp_endpoints();
             }
 
             unsafe {

@@ -1,4 +1,5 @@
 use crate::proxy::socks5::{Socks5Dialer, Socks5UdpAssociation};
+use log::{error, info, warn};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::io;
@@ -78,7 +79,7 @@ impl TransparentProxy {
         self.udp_port_v4.store(udp_port, Ordering::Relaxed);
         self.udp_port_v6.store(udp_port, Ordering::Relaxed);
 
-        println!(
+        info!(
             "Transparent proxy listening on TCP {} and UDP {} (dual-stack)",
             tcp_listener.local_addr()?,
             udp_listener.local_addr()?
@@ -128,7 +129,7 @@ impl TransparentProxy {
                     thread::sleep(Duration::from_millis(10));
                 }
                 Err(err) => {
-                    eprintln!("failed to accept TCP connection: {err}");
+                    error!("failed to accept TCP connection: {err}");
                     thread::sleep(Duration::from_millis(50));
                 }
             }
@@ -139,14 +140,14 @@ impl TransparentProxy {
         let peer = match conn.peer_addr() {
             Ok(addr) => addr,
             Err(err) => {
-                eprintln!("failed to get TCP peer addr: {err}");
+                error!("failed to get TCP peer addr: {err}");
                 return;
             }
         };
         let local = match conn.local_addr() {
             Ok(addr) => addr,
             Err(err) => {
-                eprintln!("failed to get TCP local addr: {err}");
+                error!("failed to get TCP local addr: {err}");
                 return;
             }
         };
@@ -154,7 +155,7 @@ impl TransparentProxy {
         let (dst_ip, dst_port) = match (self.query_tcp_remote_peer)(peer, local) {
             Ok(value) => value,
             Err(err) => {
-                eprintln!("failed to get destination address: {err}");
+                error!("failed to get destination address: {err}");
                 return;
             }
         };
@@ -163,7 +164,7 @@ impl TransparentProxy {
         let mut remote = match self.socks5.connect_tcp(dst_addr) {
             Ok(stream) => stream,
             Err(err) => {
-                eprintln!("[TCP] Connection failed: {} -> {} ({err})", peer, dst_addr);
+                error!("[TCP] Connection failed: {} -> {} ({err})", peer, dst_addr);
                 return;
             }
         };
@@ -171,14 +172,14 @@ impl TransparentProxy {
         let mut remote_clone = match remote.try_clone() {
             Ok(stream) => stream,
             Err(err) => {
-                eprintln!("failed to clone remote stream: {err}");
+                error!("failed to clone remote stream: {err}");
                 return;
             }
         };
         let mut conn_clone = match conn.try_clone() {
             Ok(stream) => stream,
             Err(err) => {
-                eprintln!("failed to clone local stream: {err}");
+                error!("failed to clone local stream: {err}");
                 return;
             }
         };
@@ -205,7 +206,7 @@ impl TransparentProxy {
                     if let Err(err) = tx.try_send(UdpPacket { packet, client_addr }) {
                         match err {
                             mpsc::TrySendError::Full(_) => {
-                                eprintln!("dropping UDP packet (queue full)");
+                                warn!("dropping UDP packet (queue full)");
                             }
                             mpsc::TrySendError::Disconnected(_) => break,
                         }
@@ -215,7 +216,7 @@ impl TransparentProxy {
                     thread::sleep(Duration::from_millis(10));
                 }
                 Err(err) => {
-                    eprintln!("failed to read UDP packet: {err}");
+                    error!("failed to read UDP packet: {err}");
                     thread::sleep(Duration::from_millis(50));
                 }
             }
@@ -243,7 +244,7 @@ impl TransparentProxy {
         let local_addr = match listener.local_addr() {
             Ok(addr) => addr,
             Err(err) => {
-                eprintln!("failed to get UDP local addr: {err}");
+                error!("failed to get UDP local addr: {err}");
                 return;
             }
         };
@@ -251,7 +252,7 @@ impl TransparentProxy {
         let (dst_ip, dst_port) = match (self.query_udp_remote_peer)(client_addr, local_addr) {
             Ok(value) => value,
             Err(err) => {
-                eprintln!("failed to get UDP destination address: {err}");
+                error!("failed to get UDP destination address: {err}");
                 return;
             }
         };
@@ -267,7 +268,7 @@ impl TransparentProxy {
                 let assoc = match self.socks5.udp_associate() {
                     Ok(assoc) => Arc::new(assoc),
                     Err(err) => {
-                        eprintln!("[UDP] Session failed: {} -> {} ({err})", client_addr, remote_addr);
+                        error!("[UDP] Session failed: {} -> {} ({err})", client_addr, remote_addr);
                         return;
                     }
                 };
@@ -288,7 +289,7 @@ impl TransparentProxy {
         };
 
         if let Err(err) = assoc.send_to(&packet, remote_addr) {
-            eprintln!("failed to send UDP packet to remote host: {err}");
+            error!("failed to send UDP packet to remote host: {err}");
         }
     }
 
@@ -311,14 +312,14 @@ impl TransparentProxy {
                             continue;
                         }
                         if let Err(err) = listener.send_to(&buf[..payload_len], client_addr) {
-                            eprintln!("failed to send UDP response to client: {err}");
+                            error!("failed to send UDP response to client: {err}");
                         }
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::TimedOut => {
                         continue;
                     }
                     Err(err) => {
-                        eprintln!("[UDP] Session destroyed: {} -> {} ({err})", client_addr, remote_addr);
+                        error!("[UDP] Session destroyed: {} -> {} ({err})", client_addr, remote_addr);
                         break;
                     }
                 }
