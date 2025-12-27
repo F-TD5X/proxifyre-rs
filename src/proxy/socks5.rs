@@ -46,6 +46,7 @@ impl Socks5Dialer {
         // Bind address 0.0.0.0:0 to let proxy pick the relay.
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         let relay = send_request(&mut stream, Command::UdpAssociate, bind_addr)?;
+        let relay = normalize_udp_relay(relay, self.proxy_addr);
 
         let udp = match relay {
             SocketAddr::V4(_) => UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?,
@@ -449,5 +450,28 @@ fn maybe_map_ipv4_to_ipv6_mapped(addr: SocketAddr, prefer_mapped: bool) -> Socke
     match addr {
         SocketAddr::V4(v4) => SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port()),
         SocketAddr::V6(v6) => SocketAddr::V6(v6),
+    }
+}
+
+fn normalize_udp_relay(relay: SocketAddr, proxy_addr: SocketAddr) -> SocketAddr {
+    match relay {
+        SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
+            match proxy_addr.ip() {
+                IpAddr::V4(ip) => SocketAddr::new(IpAddr::V4(ip), v4.port()),
+                IpAddr::V6(ip) => ip
+                    .to_ipv4()
+                    .map(|v4_ip| SocketAddr::new(IpAddr::V4(v4_ip), v4.port()))
+                    .unwrap_or(relay),
+            }
+        }
+        SocketAddr::V6(v6) if v6.ip().is_unspecified() => {
+            match proxy_addr.ip() {
+                IpAddr::V6(ip) => SocketAddr::new(IpAddr::V6(ip), v6.port()),
+                IpAddr::V4(ip) => {
+                    SocketAddr::new(IpAddr::V6(ip.to_ipv6_mapped()), v6.port())
+                }
+            }
+        }
+        _ => relay,
     }
 }

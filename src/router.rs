@@ -54,8 +54,8 @@ struct UdpPortMapping {
 pub struct SocksLocalRouter {
     adapter_name: Arc<Mutex<String>>,
     process_lookup: ProcessLookup,
-    tcp_connections: Arc<Mutex<HashMap<(IpAddr, u16), TcpPortMapping>>>,
-    udp_endpoints: Arc<Mutex<HashMap<(IpAddr, u16), UdpPortMapping>>>,
+    tcp_connections: Arc<Mutex<HashMap<(IpAddr, IpAddr, u16), TcpPortMapping>>>,
+    udp_endpoints: Arc<Mutex<HashMap<(IpAddr, IpAddr, u16), UdpPortMapping>>>,
     proxies: Arc<Mutex<Vec<Arc<TransparentProxy>>>>,
     name_to_proxy: Arc<Mutex<HashMap<String, usize>>>,
     static_filters: Arc<Mutex<Vec<StaticFilter>>>,
@@ -113,22 +113,51 @@ impl SocksLocalRouter {
         let tcp_map = Arc::clone(&self.tcp_connections);
         let udp_map = Arc::clone(&self.udp_endpoints);
 
-        let query_tcp = Arc::new(move |peer: SocketAddr| {
+        let query_tcp = Arc::new(move |peer: SocketAddr, local: SocketAddr| {
             let peer = normalize_mapped_ipv6(peer);
-            let key = (peer.ip(), peer.port());
+            let local = normalize_mapped_ipv6(local);
+            let key = (peer.ip(), local.ip(), peer.port());
             let map = tcp_map.lock().unwrap();
             map.get(&key)
                 .map(|entry| (entry.dst_ip, entry.dst_port))
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "original destination not found"))
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "original destination not found")
+                })
         });
 
-        let query_udp = Arc::new(move |peer: SocketAddr| {
+        let query_udp = Arc::new(move |peer: SocketAddr, local: SocketAddr| {
             let peer = normalize_mapped_ipv6(peer);
-            let key = (peer.ip(), peer.port());
+            let local = normalize_mapped_ipv6(local);
             let map = udp_map.lock().unwrap();
-            map.get(&key)
+            let local_ip = local.ip();
+            let key = (peer.ip(), local_ip, peer.port());
+            if !local_ip.is_unspecified() {
+                return map
+                    .get(&key)
+                    .map(|entry| (entry.dst_ip, entry.dst_port))
+                    .ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::NotFound, "original destination not found")
+                    });
+            }
+
+            let mut match_entry = None;
+            for ((dst_ip, _src_ip, src_port), entry) in map.iter() {
+                if *dst_ip == peer.ip() && *src_port == peer.port() {
+                    if match_entry.is_some() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "ambiguous destination mapping",
+                        ));
+                    }
+                    match_entry = Some(entry);
+                }
+            }
+
+            match_entry
                 .map(|entry| (entry.dst_ip, entry.dst_port))
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "original destination not found"))
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "original destination not found")
+                })
         });
 
         let proxy = Arc::new(TransparentProxy::new(0, dialer, query_tcp, query_udp));
@@ -515,7 +544,7 @@ impl SocksLocalRouter {
             if let Ok(path) = self.process_lookup.find_process_path(false, src, dst) {
                 proxy_port = self.get_proxy_port_tcp(&path, false);
                 if proxy_port != 0 {
-                    let key = (dst_ip_std, src_port);
+                    let key = (dst_ip_std, src_ip_std, src_port);
                     let mut map = self.tcp_connections.lock().unwrap();
                     map.entry(key).or_insert(TcpPortMapping {
                         dst_ip: dst_ip_std,
@@ -531,7 +560,7 @@ impl SocksLocalRouter {
                 }
             }
         } else {
-            let key = (dst_ip_std, src_port);
+            let key = (dst_ip_std, src_ip_std, src_port);
             let mut map = self.tcp_connections.lock().unwrap();
             if let Some(entry) = map.get(&key).cloned() {
                 if tcp.rst() || tcp.fin() {
@@ -549,7 +578,7 @@ impl SocksLocalRouter {
         }
 
         if self.is_tcp_proxy_port(src_port) {
-            let key = (dst_ip_std, dst_port);
+            let key = (dst_ip_std, src_ip_std, dst_port);
             let mut map = self.tcp_connections.lock().unwrap();
             if let Some(entry) = map.get(&key).cloned() {
                 if tcp.rst() || tcp.fin() {
@@ -585,7 +614,7 @@ impl SocksLocalRouter {
             if let Ok(path) = self.process_lookup.find_process_path(false, src, dst) {
                 proxy_port = self.get_proxy_port_tcp(&path, true);
                 if proxy_port != 0 {
-                    let key = (dst_ip_std, src_port);
+                    let key = (dst_ip_std, src_ip_std, src_port);
                     let mut map = self.tcp_connections.lock().unwrap();
                     map.entry(key).or_insert(TcpPortMapping {
                         dst_ip: dst_ip_std,
@@ -601,7 +630,7 @@ impl SocksLocalRouter {
                 }
             }
         } else {
-            let key = (dst_ip_std, src_port);
+            let key = (dst_ip_std, src_ip_std, src_port);
             let mut map = self.tcp_connections.lock().unwrap();
             if let Some(entry) = map.get(&key).cloned() {
                 if tcp.rst() || tcp.fin() {
@@ -619,7 +648,7 @@ impl SocksLocalRouter {
         }
 
         if self.is_tcp_proxy_port(src_port) {
-            let key = (dst_ip_std, dst_port);
+            let key = (dst_ip_std, src_ip_std, dst_port);
             let mut map = self.tcp_connections.lock().unwrap();
             if let Some(entry) = map.get(&key).cloned() {
                 if tcp.rst() || tcp.fin() {
@@ -651,12 +680,16 @@ impl SocksLocalRouter {
         let mut redirected = false;
         let mut proxy_port = 0u16;
 
-        let key = (dst_ip_std, src_port);
+        let key = (dst_ip_std, src_ip_std, src_port);
         {
             let mut map = self.udp_endpoints.lock().unwrap();
             if let Some(entry) = map.get(&key).cloned() {
-                redirected = true;
-                proxy_port = entry.proxy_port;
+                if entry.dst_port == dst_port {
+                    redirected = true;
+                    proxy_port = entry.proxy_port;
+                } else {
+                    return false;
+                }
             } else if let Ok(path) = self.process_lookup.find_process_path(true, src, dst) {
                 proxy_port = self.get_proxy_port_udp(&path, false);
                 if proxy_port != 0 {
@@ -684,7 +717,7 @@ impl SocksLocalRouter {
         }
 
         if self.is_udp_proxy_port(src_port) {
-            let key = (dst_ip_std, dst_port);
+            let key = (dst_ip_std, src_ip_std, dst_port);
             let map = self.udp_endpoints.lock().unwrap();
             if let Some(entry) = map.get(&key).cloned() {
                 udp.set_src_port(entry.dst_port);
@@ -712,12 +745,16 @@ impl SocksLocalRouter {
         let mut redirected = false;
         let mut proxy_port = 0u16;
 
-        let key = (dst_ip_std, src_port);
+        let key = (dst_ip_std, src_ip_std, src_port);
         {
             let mut map = self.udp_endpoints.lock().unwrap();
             if let Some(entry) = map.get(&key).cloned() {
-                redirected = true;
-                proxy_port = entry.proxy_port;
+                if entry.dst_port == dst_port {
+                    redirected = true;
+                    proxy_port = entry.proxy_port;
+                } else {
+                    return false;
+                }
             } else if let Ok(path) = self.process_lookup.find_process_path(true, src, dst) {
                 proxy_port = self.get_proxy_port_udp(&path, true);
                 if proxy_port != 0 {
@@ -745,7 +782,7 @@ impl SocksLocalRouter {
         }
 
         if self.is_udp_proxy_port(src_port) {
-            let key = (dst_ip_std, dst_port);
+            let key = (dst_ip_std, src_ip_std, dst_port);
             let map = self.udp_endpoints.lock().unwrap();
             if let Some(entry) = map.get(&key).cloned() {
                 udp.set_src_port(entry.dst_port);

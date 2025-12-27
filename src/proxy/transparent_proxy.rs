@@ -1,15 +1,19 @@
 use crate::proxy::socks5::{Socks5Dialer, Socks5UdpAssociation};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::io;
-use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-pub type QueryTcpRemotePeer = Arc<dyn Fn(SocketAddr) -> io::Result<(IpAddr, u16)> + Send + Sync>;
-pub type QueryUdpRemotePeer = Arc<dyn Fn(SocketAddr) -> io::Result<(IpAddr, u16)> + Send + Sync>;
+pub type QueryTcpRemotePeer =
+    Arc<dyn Fn(SocketAddr, SocketAddr) -> io::Result<(IpAddr, u16)> + Send + Sync>;
+pub type QueryUdpRemotePeer =
+    Arc<dyn Fn(SocketAddr, SocketAddr) -> io::Result<(IpAddr, u16)> + Send + Sync>;
+
+const UDP_QUEUE_SIZE: usize = 1024;
 
 pub struct TransparentProxy {
     port: u16,
@@ -84,8 +88,21 @@ impl TransparentProxy {
         let tcp_handle = thread::spawn(move || tcp_proxy.accept_tcp_connections(tcp_listener));
         self.handles.lock().unwrap().push(tcp_handle);
 
+        let udp_listener = Arc::new(udp_listener);
+        let (udp_tx, udp_rx) = mpsc::sync_channel(UDP_QUEUE_SIZE);
+
         let udp_proxy = Arc::clone(self);
-        let udp_handle = thread::spawn(move || udp_proxy.accept_udp_connections(udp_listener));
+        let udp_listener_worker = Arc::clone(&udp_listener);
+        let udp_worker = thread::spawn(move || {
+            udp_proxy.udp_worker_loop(udp_listener_worker, udp_rx);
+        });
+        self.handles.lock().unwrap().push(udp_worker);
+
+        let udp_proxy = Arc::clone(self);
+        let udp_listener_accept = Arc::clone(&udp_listener);
+        let udp_handle = thread::spawn(move || {
+            udp_proxy.accept_udp_connections(udp_listener_accept, udp_tx);
+        });
         self.handles.lock().unwrap().push(udp_handle);
 
         Ok(())
@@ -126,8 +143,15 @@ impl TransparentProxy {
                 return;
             }
         };
+        let local = match conn.local_addr() {
+            Ok(addr) => addr,
+            Err(err) => {
+                eprintln!("failed to get TCP local addr: {err}");
+                return;
+            }
+        };
 
-        let (dst_ip, dst_port) = match (self.query_tcp_remote_peer)(peer) {
+        let (dst_ip, dst_port) = match (self.query_tcp_remote_peer)(peer, local) {
             Ok(value) => value,
             Err(err) => {
                 eprintln!("failed to get destination address: {err}");
@@ -167,17 +191,25 @@ impl TransparentProxy {
         let _ = uplink.join();
     }
 
-    fn accept_udp_connections(self: Arc<Self>, listener: UdpSocket) {
-        let listener = Arc::new(listener);
+    fn accept_udp_connections(
+        self: Arc<Self>,
+        listener: Arc<UdpSocket>,
+        tx: mpsc::SyncSender<UdpPacket>,
+    ) {
         let mut buf = vec![0u8; 65535];
 
         while !self.shutdown.load(Ordering::Relaxed) {
             match listener.recv_from(&mut buf) {
                 Ok((n, client_addr)) => {
-                    let proxy = Arc::clone(&self);
-                    let listener = Arc::clone(&listener);
                     let packet = buf[..n].to_vec();
-                    thread::spawn(move || proxy.handle_udp_packet(listener, packet, client_addr));
+                    if let Err(err) = tx.try_send(UdpPacket { packet, client_addr }) {
+                        match err {
+                            mpsc::TrySendError::Full(_) => {
+                                eprintln!("dropping UDP packet (queue full)");
+                            }
+                            mpsc::TrySendError::Disconnected(_) => break,
+                        }
+                    }
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
@@ -190,8 +222,33 @@ impl TransparentProxy {
         }
     }
 
-    fn handle_udp_packet(self: Arc<Self>, listener: Arc<UdpSocket>, packet: Vec<u8>, client_addr: SocketAddr) {
-        let (dst_ip, dst_port) = match (self.query_udp_remote_peer)(client_addr) {
+    fn udp_worker_loop(self: Arc<Self>, listener: Arc<UdpSocket>, rx: mpsc::Receiver<UdpPacket>) {
+        while !self.shutdown.load(Ordering::Relaxed) {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(work) => {
+                    self.handle_udp_packet(Arc::clone(&listener), work.packet, work.client_addr);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn handle_udp_packet(
+        &self,
+        listener: Arc<UdpSocket>,
+        packet: Vec<u8>,
+        client_addr: SocketAddr,
+    ) {
+        let local_addr = match listener.local_addr() {
+            Ok(addr) => addr,
+            Err(err) => {
+                eprintln!("failed to get UDP local addr: {err}");
+                return;
+            }
+        };
+
+        let (dst_ip, dst_port) = match (self.query_udp_remote_peer)(client_addr, local_addr) {
             Ok(value) => value,
             Err(err) => {
                 eprintln!("failed to get UDP destination address: {err}");
@@ -271,6 +328,11 @@ impl TransparentProxy {
             map.remove(&local_key);
         });
     }
+}
+
+struct UdpPacket {
+    packet: Vec<u8>,
+    client_addr: SocketAddr,
 }
 
 fn bind_dual_stack_tcp(port: u16) -> io::Result<TcpListener> {

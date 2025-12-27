@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, NO_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6TABLE_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
@@ -15,7 +16,16 @@ use windows::Win32::System::Threading::{
 
 #[derive(Clone, Default)]
 pub struct ProcessLookup {
-    cache: Arc<Mutex<HashMap<u32, String>>>,
+    cache: Arc<Mutex<HashMap<u32, CachedProcess>>>,
+}
+
+const PROCESS_CACHE_TTL: Duration = Duration::from_secs(300);
+const PROCESS_CACHE_MAX: usize = 1024;
+
+#[derive(Clone)]
+struct CachedProcess {
+    path: String,
+    last_seen: Instant,
 }
 
 impl ProcessLookup {
@@ -39,12 +49,33 @@ impl ProcessLookup {
 
         let pid = pid.context("process id not found")?;
 
-        if let Some(path) = self.cache.lock().unwrap().get(&pid).cloned() {
-            return Ok(path);
+        let now = Instant::now();
+        {
+            let mut cache = self.cache.lock().unwrap();
+            if let Some(entry) = cache.get_mut(&pid) {
+                if now.duration_since(entry.last_seen) <= PROCESS_CACHE_TTL {
+                    entry.last_seen = now;
+                    return Ok(entry.path.clone());
+                }
+                cache.remove(&pid);
+            }
         }
 
         let path = query_process_path(pid)?;
-        self.cache.lock().unwrap().insert(pid, path.clone());
+        let mut cache = self.cache.lock().unwrap();
+        cache.insert(
+            pid,
+            CachedProcess {
+                path: path.clone(),
+                last_seen: now,
+            },
+        );
+        if cache.len() > PROCESS_CACHE_MAX {
+            cache.retain(|_, entry| now.duration_since(entry.last_seen) <= PROCESS_CACHE_TTL);
+            if cache.len() > PROCESS_CACHE_MAX {
+                cache.clear();
+            }
+        }
         Ok(path)
     }
 }
