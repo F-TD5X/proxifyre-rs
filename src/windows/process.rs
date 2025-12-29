@@ -86,23 +86,22 @@ fn find_pid_tcp_v4(local: SocketAddrV4, remote: SocketAddrV4) -> Option<u32> {
     let entries = table.dwNumEntries as usize;
     let rows = table.table.as_ptr();
 
-    for i in 0..entries {
-        let row = unsafe { *rows.add(i) };
-        let row_local_port = u16::from_be(row.dwLocalPort as u16);
-        let row_remote_port = u16::from_be(row.dwRemotePort as u16);
-        let row_local_addr = Ipv4Addr::from(u32::from_be(row.dwLocalAddr));
-        let row_remote_addr = Ipv4Addr::from(u32::from_be(row.dwRemoteAddr));
+    find_pid_in_rows(
+        rows,
+        entries,
+        |row| {
+            let row_local_port = u16::from_be(row.dwLocalPort as u16);
+            let row_remote_port = u16::from_be(row.dwRemotePort as u16);
+            let row_local_addr = Ipv4Addr::from(u32::from_be(row.dwLocalAddr));
+            let row_remote_addr = Ipv4Addr::from(u32::from_be(row.dwRemoteAddr));
 
-        if row_local_port == local.port()
-            && row_remote_port == remote.port()
-            && row_local_addr == *local.ip()
-            && row_remote_addr == *remote.ip()
-        {
-            return Some(row.dwOwningPid);
-        }
-    }
-
-    None
+            row_local_port == local.port()
+                && row_remote_port == remote.port()
+                && row_local_addr == *local.ip()
+                && row_remote_addr == *remote.ip()
+        },
+        |row| row.dwOwningPid,
+    )
 }
 
 fn find_pid_tcp_v6(local: SocketAddrV6, remote: SocketAddrV6) -> Option<u32> {
@@ -111,23 +110,22 @@ fn find_pid_tcp_v6(local: SocketAddrV6, remote: SocketAddrV6) -> Option<u32> {
     let entries = table.dwNumEntries as usize;
     let rows = table.table.as_ptr();
 
-    for i in 0..entries {
-        let row = unsafe { *rows.add(i) };
-        let row_local_port = u16::from_be(row.dwLocalPort as u16);
-        let row_remote_port = u16::from_be(row.dwRemotePort as u16);
-        let row_local_addr = Ipv6Addr::from(row.ucLocalAddr);
-        let row_remote_addr = Ipv6Addr::from(row.ucRemoteAddr);
+    find_pid_in_rows(
+        rows,
+        entries,
+        |row| {
+            let row_local_port = u16::from_be(row.dwLocalPort as u16);
+            let row_remote_port = u16::from_be(row.dwRemotePort as u16);
+            let row_local_addr = Ipv6Addr::from(row.ucLocalAddr);
+            let row_remote_addr = Ipv6Addr::from(row.ucRemoteAddr);
 
-        if row_local_port == local.port()
-            && row_remote_port == remote.port()
-            && row_local_addr == *local.ip()
-            && row_remote_addr == *remote.ip()
-        {
-            return Some(row.dwOwningPid);
-        }
-    }
-
-    None
+            row_local_port == local.port()
+                && row_remote_port == remote.port()
+                && row_local_addr == *local.ip()
+                && row_remote_addr == *remote.ip()
+        },
+        |row| row.dwOwningPid,
+    )
 }
 
 fn find_pid_udp_v4(local: SocketAddrV4) -> Option<u32> {
@@ -136,19 +134,18 @@ fn find_pid_udp_v4(local: SocketAddrV4) -> Option<u32> {
     let entries = table.dwNumEntries as usize;
     let rows = table.table.as_ptr();
 
-    for i in 0..entries {
-        let row = unsafe { *rows.add(i) };
-        let row_local_port = u16::from_be(row.dwLocalPort as u16);
-        let row_local_addr = Ipv4Addr::from(u32::from_be(row.dwLocalAddr));
+    find_pid_in_rows(
+        rows,
+        entries,
+        |row| {
+            let row_local_port = u16::from_be(row.dwLocalPort as u16);
+            let row_local_addr = Ipv4Addr::from(u32::from_be(row.dwLocalAddr));
 
-        if row_local_port == local.port()
-            && (row_local_addr == *local.ip() || row_local_addr == Ipv4Addr::UNSPECIFIED)
-        {
-            return Some(row.dwOwningPid);
-        }
-    }
-
-    None
+            row_local_port == local.port()
+                && (row_local_addr == *local.ip() || row_local_addr == Ipv4Addr::UNSPECIFIED)
+        },
+        |row| row.dwOwningPid,
+    )
 }
 
 fn find_pid_udp_v6(local: SocketAddrV6) -> Option<u32> {
@@ -157,18 +154,32 @@ fn find_pid_udp_v6(local: SocketAddrV6) -> Option<u32> {
     let entries = table.dwNumEntries as usize;
     let rows = table.table.as_ptr();
 
-    for i in 0..entries {
-        let row = unsafe { *rows.add(i) };
-        let row_local_port = u16::from_be(row.dwLocalPort as u16);
-        let row_local_addr = Ipv6Addr::from(row.ucLocalAddr);
+    find_pid_in_rows(
+        rows,
+        entries,
+        |row| {
+            let row_local_port = u16::from_be(row.dwLocalPort as u16);
+            let row_local_addr = Ipv6Addr::from(row.ucLocalAddr);
 
-        if row_local_port == local.port()
-            && (row_local_addr == *local.ip() || row_local_addr == Ipv6Addr::UNSPECIFIED)
-        {
-            return Some(row.dwOwningPid);
+            row_local_port == local.port()
+                && (row_local_addr == *local.ip() || row_local_addr == Ipv6Addr::UNSPECIFIED)
+        },
+        |row| row.dwOwningPid,
+    )
+}
+
+fn find_pid_in_rows<T>(
+    rows: *const T,
+    entries: usize,
+    matches: impl Fn(&T) -> bool,
+    pid: impl Fn(&T) -> u32,
+) -> Option<u32> {
+    for i in 0..entries {
+        let row = unsafe { &*rows.add(i) };
+        if matches(row) {
+            return Some(pid(row));
         }
     }
-
     None
 }
 

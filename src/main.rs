@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::fs::File;
+use std::fs;
 use std::sync::Arc;
 use std::thread;
 
@@ -28,9 +28,9 @@ async fn main() -> Result<()> {
         .map_err(|err| anyhow::anyhow!("failed to initialize logger: {err}"))?;
     let router = Arc::new(SocksLocalRouter::new(&driver)?);
 
-    let config_file = File::open("config.json").context("failed to open config.json")?;
-    let settings: ServiceSettings = serde_json::from_reader(config_file)
-        .context("failed to parse config.json")?;
+    let config_content = fs::read_to_string("config.toml").context("failed to open config.toml")?;
+    let settings: ServiceSettings = toml::from_str(&config_content)
+        .context("failed to parse config.toml")?;
 
     for proxy in settings.proxies {
         let proxy_id = router.add_socks5_proxy(&proxy.endpoint)?;

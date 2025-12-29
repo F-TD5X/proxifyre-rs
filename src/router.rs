@@ -45,6 +45,12 @@ enum ProxyDirection {
     FromProxy,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PortRewrite {
+    ToProxy(u16),
+    FromProxy(u16),
+}
+
 #[derive(Clone, Debug)]
 struct TcpPortMapping {
     dst_ip: IpAddr,
@@ -553,61 +559,31 @@ impl SocksLocalRouter {
 
         let src = SocketAddr::new(src_ip_std, src_port);
         let dst = SocketAddr::new(dst_ip_std, dst_port);
-
-        let mut redirected = false;
-        let mut proxy_port = 0u16;
-
-        if tcp.syn() && !tcp.ack() {
-            if let Ok(path) = self.process_lookup.find_process_path(false, src, dst) {
-                proxy_port = self.get_proxy_port_tcp(&path, false);
-                if proxy_port != 0 {
-                    let key = (dst_ip_std, src_ip_std, src_port);
-                    let mut map = self.tcp_connections.lock().unwrap();
-                    map.entry(key).or_insert(TcpPortMapping {
-                        dst_ip: dst_ip_std,
-                        dst_port,
-                        proxy_port,
-                    });
-                    redirected = true;
-                    let process_label = format_process_label(&path);
-                    info!(
-                        "[TCP] [PROXY] {} {} -> {} (redirect to {})",
-                        process_label, src, dst, proxy_port
-                    );
-                }
+        let rewrite = self.process_tcp_payload(
+            "TCP",
+            src,
+            dst,
+            src_ip_std,
+            dst_ip_std,
+            src_port,
+            dst_port,
+            false,
+            tcp.syn(),
+            tcp.ack(),
+            tcp.rst(),
+            tcp.fin(),
+        );
+        match rewrite {
+            Some(PortRewrite::ToProxy(port)) => {
+                tcp.set_dst_port(port);
+                Some(ProxyDirection::ToProxy)
             }
-        } else {
-            let key = (dst_ip_std, src_ip_std, src_port);
-            let mut map = self.tcp_connections.lock().unwrap();
-            if let Some(entry) = map.get(&key).cloned() {
-                if tcp.rst() || tcp.fin() {
-                    map.remove(&key);
-                    info!("[TCP] {} -> {} (closed)", src, dst);
-                }
-                proxy_port = entry.proxy_port;
-                redirected = true;
+            Some(PortRewrite::FromProxy(port)) => {
+                tcp.set_src_port(port);
+                Some(ProxyDirection::FromProxy)
             }
+            None => None,
         }
-
-        if redirected {
-            tcp.set_dst_port(proxy_port);
-            return Some(ProxyDirection::ToProxy);
-        }
-
-        if self.is_tcp_proxy_port(src_port) {
-            let key = (dst_ip_std, src_ip_std, dst_port);
-            let mut map = self.tcp_connections.lock().unwrap();
-            if let Some(entry) = map.get(&key).cloned() {
-                if tcp.rst() || tcp.fin() {
-                    map.remove(&key);
-                    info!("[TCP] {} -> {} (closed)", src, dst);
-                }
-                tcp.set_src_port(entry.dst_port);
-                return Some(ProxyDirection::FromProxy);
-            }
-        }
-
-        None
     }
 
     fn process_tcp_v6_payload(
@@ -623,61 +599,31 @@ impl SocksLocalRouter {
 
         let src = SocketAddr::new(src_ip_std, src_port);
         let dst = SocketAddr::new(dst_ip_std, dst_port);
-
-        let mut redirected = false;
-        let mut proxy_port = 0u16;
-
-        if tcp.syn() && !tcp.ack() {
-            if let Ok(path) = self.process_lookup.find_process_path(false, src, dst) {
-                proxy_port = self.get_proxy_port_tcp(&path, true);
-                if proxy_port != 0 {
-                    let key = (dst_ip_std, src_ip_std, src_port);
-                    let mut map = self.tcp_connections.lock().unwrap();
-                    map.entry(key).or_insert(TcpPortMapping {
-                        dst_ip: dst_ip_std,
-                        dst_port,
-                        proxy_port,
-                    });
-                    redirected = true;
-                    let process_label = format_process_label(&path);
-                    info!(
-                        "[TCPv6] [PROXY] {} {} -> {} (redirect to {})",
-                        process_label, src, dst, proxy_port
-                    );
-                }
+        let rewrite = self.process_tcp_payload(
+            "TCPv6",
+            src,
+            dst,
+            src_ip_std,
+            dst_ip_std,
+            src_port,
+            dst_port,
+            true,
+            tcp.syn(),
+            tcp.ack(),
+            tcp.rst(),
+            tcp.fin(),
+        );
+        match rewrite {
+            Some(PortRewrite::ToProxy(port)) => {
+                tcp.set_dst_port(port);
+                Some(ProxyDirection::ToProxy)
             }
-        } else {
-            let key = (dst_ip_std, src_ip_std, src_port);
-            let mut map = self.tcp_connections.lock().unwrap();
-            if let Some(entry) = map.get(&key).cloned() {
-                if tcp.rst() || tcp.fin() {
-                    map.remove(&key);
-                    info!("[TCPv6] {} -> {} (closed)", src, dst);
-                }
-                proxy_port = entry.proxy_port;
-                redirected = true;
+            Some(PortRewrite::FromProxy(port)) => {
+                tcp.set_src_port(port);
+                Some(ProxyDirection::FromProxy)
             }
+            None => None,
         }
-
-        if redirected {
-            tcp.set_dst_port(proxy_port);
-            return Some(ProxyDirection::ToProxy);
-        }
-
-        if self.is_tcp_proxy_port(src_port) {
-            let key = (dst_ip_std, src_ip_std, dst_port);
-            let mut map = self.tcp_connections.lock().unwrap();
-            if let Some(entry) = map.get(&key).cloned() {
-                if tcp.rst() || tcp.fin() {
-                    map.remove(&key);
-                    info!("[TCPv6] {} -> {} (closed)", src, dst);
-                }
-                tcp.set_src_port(entry.dst_port);
-                return Some(ProxyDirection::FromProxy);
-            }
-        }
-
-        None
     }
 
     fn process_udp_v4_payload(
@@ -693,61 +639,27 @@ impl SocksLocalRouter {
 
         let src = SocketAddr::new(src_ip_std, src_port);
         let dst = SocketAddr::new(dst_ip_std, dst_port);
-
-        let mut redirected = false;
-        let mut proxy_port = 0u16;
-        let now = Instant::now();
-
-        let key = (dst_ip_std, src_ip_std, src_port);
-        {
-            let mut map = self.udp_endpoints.lock().unwrap();
-            if let Some(entry) = map.get(&key).cloned() {
-                if entry.dst_port == dst_port {
-                    redirected = true;
-                    proxy_port = entry.proxy_port;
-                    if let Some(e) = map.get_mut(&key) {
-                        e.last_active = now;
-                    }
-                } else {
-                    return None;
-                }
-            } else if let Ok(path) = self.process_lookup.find_process_path(true, src, dst) {
-                proxy_port = self.get_proxy_port_udp(&path, false);
-                if proxy_port != 0 {
-                    map.insert(
-                        key,
-                        UdpPortMapping {
-                            dst_ip: dst_ip_std,
-                            dst_port,
-                            proxy_port,
-                            last_active: now,
-                        },
-                    );
-                    redirected = true;
-                    let process_label = format_process_label(&path);
-                    info!(
-                        "[UDP] [PROXY] {} {} -> {} (redirect to {})",
-                        process_label, src, dst, proxy_port
-                    );
-                }
+        let rewrite = self.process_udp_payload(
+            "UDP",
+            src,
+            dst,
+            src_ip_std,
+            dst_ip_std,
+            src_port,
+            dst_port,
+            false,
+        );
+        match rewrite {
+            Some(PortRewrite::ToProxy(port)) => {
+                udp.set_dst_port(port);
+                Some(ProxyDirection::ToProxy)
             }
-        }
-
-        if redirected {
-            udp.set_dst_port(proxy_port);
-            return Some(ProxyDirection::ToProxy);
-        }
-
-        if self.is_udp_proxy_port(src_port) {
-            let key = (dst_ip_std, src_ip_std, dst_port);
-            let map = self.udp_endpoints.lock().unwrap();
-            if let Some(entry) = map.get(&key).cloned() {
-                udp.set_src_port(entry.dst_port);
-                return Some(ProxyDirection::FromProxy);
+            Some(PortRewrite::FromProxy(port)) => {
+                udp.set_src_port(port);
+                Some(ProxyDirection::FromProxy)
             }
+            None => None,
         }
-
-        None
     }
 
     fn process_udp_v6_payload(
@@ -763,7 +675,109 @@ impl SocksLocalRouter {
 
         let src = SocketAddr::new(src_ip_std, src_port);
         let dst = SocketAddr::new(dst_ip_std, dst_port);
+        let rewrite = self.process_udp_payload(
+            "UDPv6",
+            src,
+            dst,
+            src_ip_std,
+            dst_ip_std,
+            src_port,
+            dst_port,
+            true,
+        );
+        match rewrite {
+            Some(PortRewrite::ToProxy(port)) => {
+                udp.set_dst_port(port);
+                Some(ProxyDirection::ToProxy)
+            }
+            Some(PortRewrite::FromProxy(port)) => {
+                udp.set_src_port(port);
+                Some(ProxyDirection::FromProxy)
+            }
+            None => None,
+        }
+    }
 
+    fn process_tcp_payload(
+        &self,
+        label: &str,
+        src: SocketAddr,
+        dst: SocketAddr,
+        src_ip_std: IpAddr,
+        dst_ip_std: IpAddr,
+        src_port: u16,
+        dst_port: u16,
+        is_v6: bool,
+        syn: bool,
+        ack: bool,
+        rst: bool,
+        fin: bool,
+    ) -> Option<PortRewrite> {
+        let mut redirected = false;
+        let mut proxy_port = 0u16;
+
+        if syn && !ack {
+            if let Ok(path) = self.process_lookup.find_process_path(false, src, dst) {
+                proxy_port = self.get_proxy_port_tcp(&path, is_v6);
+                if proxy_port != 0 {
+                    let key = (dst_ip_std, src_ip_std, src_port);
+                    let mut map = self.tcp_connections.lock().unwrap();
+                    map.entry(key).or_insert(TcpPortMapping {
+                        dst_ip: dst_ip_std,
+                        dst_port,
+                        proxy_port,
+                    });
+                    redirected = true;
+                    let process_label = format_process_label(&path);
+                    info!(
+                        "[{}] [PROXY] {} {} -> {} (redirect to {})",
+                        label, process_label, src, dst, proxy_port
+                    );
+                }
+            }
+        } else {
+            let key = (dst_ip_std, src_ip_std, src_port);
+            let mut map = self.tcp_connections.lock().unwrap();
+            if let Some(entry) = map.get(&key).cloned() {
+                if rst || fin {
+                    map.remove(&key);
+                    info!("[{}] {} -> {} (closed)", label, src, dst);
+                }
+                proxy_port = entry.proxy_port;
+                redirected = true;
+            }
+        }
+
+        if redirected {
+            return Some(PortRewrite::ToProxy(proxy_port));
+        }
+
+        if self.is_tcp_proxy_port(src_port) {
+            let key = (dst_ip_std, src_ip_std, dst_port);
+            let mut map = self.tcp_connections.lock().unwrap();
+            if let Some(entry) = map.get(&key).cloned() {
+                if rst || fin {
+                    map.remove(&key);
+                    info!("[{}] {} -> {} (closed)", label, src, dst);
+                }
+                return Some(PortRewrite::FromProxy(entry.dst_port));
+            }
+        }
+
+        None
+    }
+
+    fn process_udp_payload(
+        &self,
+        label: &str,
+        src: SocketAddr,
+        dst: SocketAddr,
+        src_ip_std: IpAddr,
+        dst_ip_std: IpAddr,
+        src_port: u16,
+        dst_port: u16,
+        is_v6: bool,
+    ) -> Option<PortRewrite> {
         let mut redirected = false;
         let mut proxy_port = 0u16;
         let now = Instant::now();
@@ -782,7 +796,7 @@ impl SocksLocalRouter {
                     return None;
                 }
             } else if let Ok(path) = self.process_lookup.find_process_path(true, src, dst) {
-                proxy_port = self.get_proxy_port_udp(&path, true);
+                proxy_port = self.get_proxy_port_udp(&path, is_v6);
                 if proxy_port != 0 {
                     map.insert(
                         key,
@@ -796,24 +810,22 @@ impl SocksLocalRouter {
                     redirected = true;
                     let process_label = format_process_label(&path);
                     info!(
-                        "[UDPv6] [PROXY] {} {} -> {} (redirect to {})",
-                        process_label, src, dst, proxy_port
+                        "[{}] [PROXY] {} {} -> {} (redirect to {})",
+                        label, process_label, src, dst, proxy_port
                     );
                 }
             }
         }
 
         if redirected {
-            udp.set_dst_port(proxy_port);
-            return Some(ProxyDirection::ToProxy);
+            return Some(PortRewrite::ToProxy(proxy_port));
         }
 
         if self.is_udp_proxy_port(src_port) {
             let key = (dst_ip_std, src_ip_std, dst_port);
             let map = self.udp_endpoints.lock().unwrap();
             if let Some(entry) = map.get(&key).cloned() {
-                udp.set_src_port(entry.dst_port);
-                return Some(ProxyDirection::FromProxy);
+                return Some(PortRewrite::FromProxy(entry.dst_port));
             }
         }
 
@@ -916,64 +928,41 @@ fn build_icmp_pass_filter() -> StaticFilter {
 
 fn build_proxy_pass_filters(ip: Ipv4Addr, port: u16) -> Vec<StaticFilter> {
     let dest = ipv4_subnet_filter(ip, Ipv4Addr::new(255, 255, 255, 255));
-
-    let tcp_out = build_proxy_pass_filter(
-        DirectionFlags::PACKET_FLAG_ON_SEND,
-        dest,
-        IPPROTO_TCP,
-        false,
-        port,
-    );
-    let tcp_in = build_proxy_pass_filter(
-        DirectionFlags::PACKET_FLAG_ON_RECEIVE,
-        dest,
-        IPPROTO_TCP,
-        true,
-        port,
-    );
-    let udp_out = build_proxy_pass_filter(
-        DirectionFlags::PACKET_FLAG_ON_SEND,
-        dest,
-        IPPROTO_UDP,
-        false,
-        port,
-    );
-    let udp_in = build_proxy_pass_filter(
-        DirectionFlags::PACKET_FLAG_ON_RECEIVE,
-        dest,
-        IPPROTO_UDP,
-        true,
-        port,
-    );
-
-    vec![tcp_out, tcp_in, udp_out, udp_in]
+    build_proxy_pass_filters_common(dest, port, build_proxy_pass_filter)
 }
 
 fn build_proxy_pass_filters_v6(ip: Ipv6Addr, port: u16) -> Vec<StaticFilter> {
     let dest = ipv6_subnet_filter(ip, Ipv6Addr::from(u128::MAX));
+    build_proxy_pass_filters_common(dest, port, build_proxy_pass_filter_v6)
+}
 
-    let tcp_out = build_proxy_pass_filter_v6(
+fn build_proxy_pass_filters_common<T: Copy>(
+    dest: T,
+    port: u16,
+    build: impl Fn(DirectionFlags, T, u8, bool, u16) -> StaticFilter,
+) -> Vec<StaticFilter> {
+    let tcp_out = build(
         DirectionFlags::PACKET_FLAG_ON_SEND,
         dest,
         IPPROTO_TCP,
         false,
         port,
     );
-    let tcp_in = build_proxy_pass_filter_v6(
+    let tcp_in = build(
         DirectionFlags::PACKET_FLAG_ON_RECEIVE,
         dest,
         IPPROTO_TCP,
         true,
         port,
     );
-    let udp_out = build_proxy_pass_filter_v6(
+    let udp_out = build(
         DirectionFlags::PACKET_FLAG_ON_SEND,
         dest,
         IPPROTO_UDP,
         false,
         port,
     );
-    let udp_in = build_proxy_pass_filter_v6(
+    let udp_in = build(
         DirectionFlags::PACKET_FLAG_ON_RECEIVE,
         dest,
         IPPROTO_UDP,

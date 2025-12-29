@@ -337,20 +337,29 @@ struct UdpPacket {
 }
 
 fn bind_dual_stack_tcp(port: u16) -> io::Result<TcpListener> {
-    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_only_v6(false)?;
-    socket.set_nonblocking(true)?;
-    let addr = socket2::SockAddr::from(std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port)));
-    socket.bind(&addr)?;
-    socket.listen(128)?;
+    let socket = bind_dual_stack_socket(port, Type::STREAM, Protocol::TCP, true)?;
     Ok(socket.into())
 }
 
 fn bind_dual_stack_udp(port: u16) -> io::Result<UdpSocket> {
-    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    let socket = bind_dual_stack_socket(port, Type::DGRAM, Protocol::UDP, false)?;
+    Ok(socket.into())
+}
+
+fn bind_dual_stack_socket(
+    port: u16,
+    socket_type: Type,
+    protocol: Protocol,
+    listen: bool,
+) -> io::Result<Socket> {
+    let socket = Socket::new(Domain::IPV6, socket_type, Some(protocol))?;
     socket.set_only_v6(false)?;
     socket.set_nonblocking(true)?;
-    let addr = socket2::SockAddr::from(std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port)));
+    let addr =
+        socket2::SockAddr::from(std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port)));
     socket.bind(&addr)?;
-    Ok(socket.into())
+    if listen {
+        socket.listen(128)?;
+    }
+    Ok(socket)
 }

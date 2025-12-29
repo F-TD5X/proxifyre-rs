@@ -57,7 +57,6 @@ impl Socks5Dialer {
 
         Ok(Socks5UdpAssociation {
             udp,
-            relay,
             prefer_ipv4_mapped_ipv6: self.prefer_ipv4_mapped_ipv6,
             _tcp: stream,
         })
@@ -66,7 +65,6 @@ impl Socks5Dialer {
 
 pub struct Socks5UdpAssociation {
     pub udp: UdpSocket,
-    pub relay: SocketAddr,
     prefer_ipv4_mapped_ipv6: bool,
     _tcp: TcpStream,
 }

@@ -38,14 +38,6 @@ impl TuiState {
         }
     }
 
-    pub fn add_log(&self, log: String) {
-        let mut logs = self.logs.lock().unwrap();
-        logs.push(log);
-        if logs.len() > 1000 {
-            logs.remove(0);
-        }
-    }
-
     pub fn format_bytes(&self, bytes: u64) -> String {
         if bytes < 1024 {
             format!("{} B", bytes)
@@ -212,15 +204,6 @@ impl Tui {
 
         frame.render_widget(paragraph, area);
     }
-}
-
-pub struct ConnectionInfo {
-    pub local_addr: String,
-    pub remote_addr: String,
-    pub process: String,
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
-    pub timestamp: Instant,
 }
 
 struct CpuSampler {

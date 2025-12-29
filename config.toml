@@ -1,0 +1,7 @@
+[[proxies]]
+endpoint = "127.0.0.1:1080"
+appNames = ["firefox.exe", "chrome.exe"]
+
+[[proxies]]
+endpoint = "127.0.0.1:1081"
+appNames = ["discord.exe"]
