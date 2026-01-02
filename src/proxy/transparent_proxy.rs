@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub type QueryTcpRemotePeer =
     Arc<dyn Fn(SocketAddr, SocketAddr) -> io::Result<(IpAddr, u16)> + Send + Sync>;
@@ -15,6 +15,7 @@ pub type QueryUdpRemotePeer =
     Arc<dyn Fn(SocketAddr, SocketAddr) -> io::Result<(IpAddr, u16)> + Send + Sync>;
 
 const UDP_QUEUE_SIZE: usize = 1024;
+const UDP_ASSOCIATION_TIMEOUT_SECS: u64 = 120;
 
 pub struct TransparentProxy {
     port: u16,
@@ -26,8 +27,9 @@ pub struct TransparentProxy {
     shutdown: Arc<AtomicBool>,
     query_tcp_remote_peer: QueryTcpRemotePeer,
     query_udp_remote_peer: QueryUdpRemotePeer,
-    udp_connections: Arc<Mutex<HashMap<String, Arc<Socks5UdpAssociation>>>>,
+    udp_connections: Arc<Mutex<HashMap<String, UdpAssociationEntry>>>,
     handles: Mutex<Vec<JoinHandle<()>>>,
+    udp_reader_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl TransparentProxy {
@@ -49,6 +51,7 @@ impl TransparentProxy {
             query_udp_remote_peer,
             udp_connections: Arc::new(Mutex::new(HashMap::new())),
             handles: Mutex::new(Vec::new()),
+            udp_reader_handles: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -113,6 +116,10 @@ impl TransparentProxy {
         self.shutdown.store(true, Ordering::Relaxed);
         let mut handles = self.handles.lock().unwrap();
         while let Some(handle) = handles.pop() {
+            let _ = handle.join();
+        }
+        let mut udp_reader_handles = self.udp_reader_handles.lock().unwrap();
+        while let Some(handle) = udp_reader_handles.pop() {
             let _ = handle.join();
         }
     }
@@ -203,7 +210,10 @@ impl TransparentProxy {
             match listener.recv_from(&mut buf) {
                 Ok((n, client_addr)) => {
                     let packet = buf[..n].to_vec();
-                    if let Err(err) = tx.try_send(UdpPacket { packet, client_addr }) {
+                    if let Err(err) = tx.try_send(UdpPacket {
+                        packet,
+                        client_addr,
+                    }) {
                         match err {
                             mpsc::TrySendError::Full(_) => {
                                 warn!("dropping UDP packet (queue full)");
@@ -224,19 +234,26 @@ impl TransparentProxy {
     }
 
     fn udp_worker_loop(self: Arc<Self>, listener: Arc<UdpSocket>, rx: mpsc::Receiver<UdpPacket>) {
+        let mut last_cleanup = Instant::now();
         while !self.shutdown.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(work) => {
-                    self.handle_udp_packet(Arc::clone(&listener), work.packet, work.client_addr);
+                    let this = Arc::clone(&self);
+                    this.handle_udp_packet(Arc::clone(&listener), work.packet, work.client_addr);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+
+            if last_cleanup.elapsed() >= Duration::from_secs(5) {
+                self.cleanup_stale_udp_associations();
+                last_cleanup = Instant::now();
             }
         }
     }
 
     fn handle_udp_packet(
-        &self,
+        self: Arc<Self>,
         listener: Arc<UdpSocket>,
         packet: Vec<u8>,
         client_addr: SocketAddr,
@@ -262,13 +279,17 @@ impl TransparentProxy {
 
         let assoc = {
             let mut map = self.udp_connections.lock().unwrap();
-            if let Some(assoc) = map.get(&local_key) {
-                Arc::clone(assoc)
+            if let Some(entry) = map.get_mut(&local_key) {
+                entry.last_active = Instant::now();
+                Arc::clone(&entry.assoc)
             } else {
                 let assoc = match self.socks5.udp_associate() {
                     Ok(assoc) => Arc::new(assoc),
                     Err(err) => {
-                        error!("[UDP] Session failed: {} -> {} ({err})", client_addr, remote_addr);
+                        error!(
+                            "[UDP] Session failed: {} -> {} ({err})",
+                            client_addr, remote_addr
+                        );
                         return;
                     }
                 };
@@ -283,7 +304,13 @@ impl TransparentProxy {
                     remote_addr,
                 );
 
-                map.insert(local_key.clone(), Arc::clone(&assoc));
+                map.insert(
+                    local_key.clone(),
+                    UdpAssociationEntry {
+                        assoc: Arc::clone(&assoc),
+                        last_active: Instant::now(),
+                    },
+                );
                 assoc
             }
         };
@@ -298,12 +325,13 @@ impl TransparentProxy {
         assoc: Arc<Socks5UdpAssociation>,
         listener: Arc<UdpSocket>,
         shutdown: Arc<AtomicBool>,
-        connections: Arc<Mutex<HashMap<String, Arc<Socks5UdpAssociation>>>>,
+        connections: Arc<Mutex<HashMap<String, UdpAssociationEntry>>>,
         local_key: String,
         client_addr: SocketAddr,
         remote_addr: SocketAddr,
     ) {
-        thread::spawn(move || {
+        let udp_reader_handles = Arc::clone(&self.udp_reader_handles);
+        let handle = thread::spawn(move || {
             let mut buf = vec![0u8; 65535];
             while !shutdown.load(Ordering::Relaxed) {
                 match assoc.recv_datagram(&mut buf) {
@@ -314,12 +342,26 @@ impl TransparentProxy {
                         if let Err(err) = listener.send_to(&buf[..payload_len], client_addr) {
                             error!("failed to send UDP response to client: {err}");
                         }
+                        if let Some(entry) = connections.lock().unwrap().get_mut(&local_key) {
+                            entry.last_active = Instant::now();
+                        } else {
+                            break;
+                        }
                     }
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::TimedOut => {
+                    Err(err)
+                        if err.kind() == io::ErrorKind::WouldBlock
+                            || err.kind() == io::ErrorKind::TimedOut =>
+                    {
+                        if connections.lock().unwrap().get(&local_key).is_none() {
+                            break;
+                        }
                         continue;
                     }
                     Err(err) => {
-                        error!("[UDP] Session destroyed: {} -> {} ({err})", client_addr, remote_addr);
+                        error!(
+                            "[UDP] Session destroyed: {} -> {} ({err})",
+                            client_addr, remote_addr
+                        );
                         break;
                     }
                 }
@@ -328,7 +370,20 @@ impl TransparentProxy {
             let mut map = connections.lock().unwrap();
             map.remove(&local_key);
         });
+        udp_reader_handles.lock().unwrap().push(handle);
     }
+
+    fn cleanup_stale_udp_associations(&self) {
+        let timeout = Duration::from_secs(UDP_ASSOCIATION_TIMEOUT_SECS);
+        let now = Instant::now();
+        let mut map = self.udp_connections.lock().unwrap();
+        map.retain(|_, entry| now.duration_since(entry.last_active) < timeout);
+    }
+}
+
+struct UdpAssociationEntry {
+    assoc: Arc<Socks5UdpAssociation>,
+    last_active: Instant,
 }
 
 struct UdpPacket {

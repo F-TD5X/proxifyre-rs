@@ -164,17 +164,16 @@ fn parse_socks5_endpoint(endpoint: &str) -> io::Result<(SocketAddr, Option<Socks
             let resolved = format!("{host}:{port_str}")
                 .to_socket_addrs()?
                 .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "failed to resolve SOCKS5 host"))?;
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "failed to resolve SOCKS5 host")
+                })?;
             resolved.ip()
         }
     };
 
-    let port: u16 = port_str.parse().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid SOCKS5 endpoint port",
-        )
-    })?;
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid SOCKS5 endpoint port"))?;
 
     if port == 0 {
         return Err(io::Error::new(
@@ -202,9 +201,9 @@ fn split_host_port(input: &str) -> io::Result<(&str, &str)> {
         return Ok((host, &rest[1..]));
     }
 
-    let pos = input.rfind(':').ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "missing port separator")
-    })?;
+    let pos = input
+        .rfind(':')
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing port separator"))?;
     Ok((&input[..pos], &input[pos + 1..]))
 }
 
@@ -220,9 +219,8 @@ fn handshake(stream: &mut TcpStream, auth: Option<&Socks5Auth>) -> io::Result<()
     if resp[0] != 0x05 || resp[1] != 0x00 {
         match resp[1] {
             0x02 => {
-                let auth = auth.ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::Other, "SOCKS5 auth required")
-                })?;
+                let auth = auth
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "SOCKS5 auth required"))?;
                 username_password_auth(stream, auth)?;
                 return Ok(());
             }
@@ -391,9 +389,17 @@ fn parse_udp_response(buf: &[u8]) -> io::Result<(usize, SocketAddr)> {
     let addr = match atyp {
         0x01 => {
             if buf.len() < offset + 4 + 2 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "IPv4 addr truncated"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "IPv4 addr truncated",
+                ));
             }
-            let ip = Ipv4Addr::new(buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]);
+            let ip = Ipv4Addr::new(
+                buf[offset],
+                buf[offset + 1],
+                buf[offset + 2],
+                buf[offset + 3],
+            );
             offset += 4;
             let port = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
             offset += 2;
@@ -401,7 +407,10 @@ fn parse_udp_response(buf: &[u8]) -> io::Result<(usize, SocketAddr)> {
         }
         0x04 => {
             if buf.len() < offset + 16 + 2 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "IPv6 addr truncated"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "IPv6 addr truncated",
+                ));
             }
             let mut ip = [0u8; 16];
             ip.copy_from_slice(&buf[offset..offset + 16]);
@@ -412,12 +421,18 @@ fn parse_udp_response(buf: &[u8]) -> io::Result<(usize, SocketAddr)> {
         }
         0x03 => {
             if buf.len() < offset + 1 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "domain truncated"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "domain truncated",
+                ));
             }
             let len = buf[offset] as usize;
             offset += 1;
             if buf.len() < offset + len + 2 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "domain addr truncated"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "domain addr truncated",
+                ));
             }
             let host = String::from_utf8_lossy(&buf[offset..offset + len]).to_string();
             offset += len;
@@ -433,7 +448,7 @@ fn parse_udp_response(buf: &[u8]) -> io::Result<(usize, SocketAddr)> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported UDP address type: {atyp}"),
-            ))
+            ));
         }
     };
 
@@ -453,23 +468,17 @@ fn maybe_map_ipv4_to_ipv6_mapped(addr: SocketAddr, prefer_mapped: bool) -> Socke
 
 fn normalize_udp_relay(relay: SocketAddr, proxy_addr: SocketAddr) -> SocketAddr {
     match relay {
-        SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
-            match proxy_addr.ip() {
-                IpAddr::V4(ip) => SocketAddr::new(IpAddr::V4(ip), v4.port()),
-                IpAddr::V6(ip) => ip
-                    .to_ipv4()
-                    .map(|v4_ip| SocketAddr::new(IpAddr::V4(v4_ip), v4.port()))
-                    .unwrap_or(relay),
-            }
-        }
-        SocketAddr::V6(v6) if v6.ip().is_unspecified() => {
-            match proxy_addr.ip() {
-                IpAddr::V6(ip) => SocketAddr::new(IpAddr::V6(ip), v6.port()),
-                IpAddr::V4(ip) => {
-                    SocketAddr::new(IpAddr::V6(ip.to_ipv6_mapped()), v6.port())
-                }
-            }
-        }
+        SocketAddr::V4(v4) if v4.ip().is_unspecified() => match proxy_addr.ip() {
+            IpAddr::V4(ip) => SocketAddr::new(IpAddr::V4(ip), v4.port()),
+            IpAddr::V6(ip) => ip
+                .to_ipv4()
+                .map(|v4_ip| SocketAddr::new(IpAddr::V4(v4_ip), v4.port()))
+                .unwrap_or(relay),
+        },
+        SocketAddr::V6(v6) if v6.ip().is_unspecified() => match proxy_addr.ip() {
+            IpAddr::V6(ip) => SocketAddr::new(IpAddr::V6(ip), v6.port()),
+            IpAddr::V4(ip) => SocketAddr::new(IpAddr::V6(ip.to_ipv6_mapped()), v6.port()),
+        },
         _ => relay,
     }
 }

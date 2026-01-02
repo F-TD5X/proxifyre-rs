@@ -3,35 +3,49 @@ name = "proxifyre"
 version = "0.1.0"
 edition = "2024"
 
-
 [package.metadata.docs.rs]
 default-target = "x86_64-pc-windows-msvc"
 targets = ["x86_64-pc-windows-msvc"]
 
 [dependencies]
 
-# NDIS API for Windows packet filtering
-ndisapi = "0.6.5"
-anyhow = "1.0"
+# Core networking
 ipnetwork = "0.20"
-serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
-smoltcp = { version = "0.11", default-features = false, features = ["proto-ipv4", "proto-ipv6", "std", "medium-ethernet", "socket-udp"] }
+socket2 = "0.5"
 tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+
+# Windows-specific
+ndisapi = "0.6.5"
 windows = { version = "0.62.2", features = [
   "Win32_Foundation",
   "Win32_NetworkManagement_IpHelper",
   "Win32_Networking_WinSock",
-  "Win32_Security",
   "Win32_System_ProcessStatus",
-  "Win32_System_SystemInformation",
-  "Win32_System_Memory",
   "Win32_System_Threading",
 ] }
-socket2 = "0.5"
+
+# Packet parsing
+smoltcp = { version = "0.11", default-features = false, features = ["proto-ipv4", "proto-ipv6", "std", "medium-ethernet", "socket-udp"] }
+
+# CLI/TUI
 crossterm = "0.28"
 ratatui = "0.28"
 unicode-width = "0.1"
+
+# Utilities
+anyhow = "1.0"
+chrono = "0.4"
 humantime = "2.1"
 log = "0.4"
-chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+debug = true

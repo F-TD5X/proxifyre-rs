@@ -1,14 +1,15 @@
 use crate::router::SocksLocalRouter;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
-    terminal::{disable_raw_mode, enable_raw_mode},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     widgets::{Block, List, ListItem, Paragraph},
-    Frame, Terminal,
 };
 use std::collections::VecDeque;
 use std::io::stdout;
@@ -67,12 +68,7 @@ impl TuiState {
     }
 
     pub fn get_process_usage(&self) -> (f64, u64) {
-        let cpu = self
-            .cpu_sampler
-            .lock()
-            .unwrap()
-            .sample()
-            .clamp(0.0, 100.0);
+        let cpu = self.cpu_sampler.lock().unwrap().sample().clamp(0.0, 100.0);
         let mem = get_process_memory_bytes().unwrap_or(0);
         (cpu, mem)
     }
@@ -101,8 +97,8 @@ impl Tui {
 
     pub fn run(&mut self) -> Result<(), std::io::Error> {
         enable_raw_mode()?;
-        let stdout = stdout();
-        let backend = CrosstermBackend::new(stdout);
+        execute!(stdout(), EnterAlternateScreen)?;
+        let backend = CrosstermBackend::new(stdout());
         let mut terminal = Terminal::new(backend)?;
 
         terminal.clear()?;
@@ -132,6 +128,7 @@ impl Tui {
             }
         }
 
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         disable_raw_mode()?;
         terminal.show_cursor()?;
         Ok(())
@@ -140,10 +137,7 @@ impl Tui {
     fn draw(&self, frame: &mut Frame) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ])
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
             .split(frame.area());
 
         self.draw_logs(frame, chunks[0]);
@@ -280,8 +274,7 @@ fn get_process_memory_bytes() -> Option<u64> {
     let mut counters = PROCESS_MEMORY_COUNTERS::default();
     counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
     unsafe {
-        GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb)
-            .ok()?;
+        GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb).ok()?;
     }
     Some(counters.WorkingSetSize as u64)
 }
@@ -327,7 +320,10 @@ impl TrafficSampler {
 
         let oldest = self.samples.front().unwrap();
         let newest = self.samples.back().unwrap();
-        let span = newest.timestamp.duration_since(oldest.timestamp).as_secs_f64();
+        let span = newest
+            .timestamp
+            .duration_since(oldest.timestamp)
+            .as_secs_f64();
         if span <= 0.0 {
             return (0.0, 0.0);
         }

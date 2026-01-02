@@ -11,7 +11,7 @@ use windows::Win32::NetworkManagement::IpHelper::{
 };
 use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 
 #[derive(Clone, Default)]
@@ -33,7 +33,12 @@ impl ProcessLookup {
         Self::default()
     }
 
-    pub fn find_process_path(&self, is_udp: bool, src: SocketAddr, dst: SocketAddr) -> Result<String> {
+    pub fn find_process_path(
+        &self,
+        is_udp: bool,
+        src: SocketAddr,
+        dst: SocketAddr,
+    ) -> Result<String> {
         let pid = if is_udp {
             match (src, dst) {
                 (SocketAddr::V4(local), _) => find_pid_udp_v4(local),

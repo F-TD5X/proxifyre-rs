@@ -31,3 +31,7 @@ coverage/
 .serena
 CLAUDE.md
 AGENTS.md
+
+.codanna/
+.codannaignore
+.fastembed_cache

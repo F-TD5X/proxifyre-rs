@@ -1,15 +1,15 @@
 use crate::proxy::{Socks5Dialer, TransparentProxy};
 use crate::windows::process::ProcessLookup;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use log::{error, info};
 use ndisapi::{
-    DataLinkLayerFilter, DirectionFlags, EthRequest, EthRequestMut, FilterFlags, FilterLayerFlags,
+    DataLinkLayerFilter, DirectionFlags, EthRequest, EthRequestMut, FILTER_PACKET_PASS,
+    FilterFlags, FilterLayerFlags, IP_SUBNET_V4_TYPE, IP_SUBNET_V6_TYPE, IPV4, IPV6,
     IntermediateBuffer, IpAddressV4, IpAddressV4Union, IpAddressV6, IpAddressV6Union, IpSubnetV4,
-    IpSubnetV6, IpV4Filter, IpV4FilterFlags, IpV6Filter, IpV6FilterFlags, MacAddress,
-    NetworkAdapterInfo, NetworkLayerFilter, NetworkLayerFilterUnion, Ndisapi, PortRange,
-    StaticFilter, StaticFilterTable, TcpUdpFilter, TcpUdpFilterFlags, TransportLayerFilter,
-    TransportLayerFilterUnion, IphlpNetworkAdapterInfo, FILTER_PACKET_PASS, IP_SUBNET_V4_TYPE,
-    IP_SUBNET_V6_TYPE, IPV4, IPV6, TCPUDP,
+    IpSubnetV6, IpV4Filter, IpV4FilterFlags, IpV6Filter, IpV6FilterFlags, IphlpNetworkAdapterInfo,
+    MacAddress, Ndisapi, NetworkLayerFilter, NetworkLayerFilterUnion, PortRange, StaticFilter,
+    StaticFilterTable, TCPUDP, TcpUdpFilter, TcpUdpFilterFlags, TransportLayerFilter,
+    TransportLayerFilterUnion,
 };
 use smoltcp::wire::{
     EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Address,
@@ -25,11 +25,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, NO_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
-    CancelMibChangeNotify2, GetBestInterface, NotifyIpInterfaceChange, MIB_IPINTERFACE_ROW,
-    MIB_NOTIFICATION_TYPE,
+    CancelMibChangeNotify2, GetBestInterface, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
+    NotifyIpInterfaceChange,
 };
 use windows::Win32::Networking::WinSock::{
-    AF_UNSPEC, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, IN_ADDR_0_0,
+    AF_UNSPEC, IN_ADDR, IN_ADDR_0, IN_ADDR_0_0, IN6_ADDR, IN6_ADDR_0,
 };
 use windows::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
 
@@ -144,7 +144,10 @@ impl SocksLocalRouter {
             map.get(&key)
                 .map(|entry| (entry.dst_ip, entry.dst_port))
                 .ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::NotFound, "original destination not found")
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "original destination not found",
+                    )
                 })
         });
 
@@ -159,7 +162,10 @@ impl SocksLocalRouter {
                     .get(&key)
                     .map(|entry| (entry.dst_ip, entry.dst_port))
                     .ok_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::NotFound, "original destination not found")
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "original destination not found",
+                        )
                     });
             }
 
@@ -179,7 +185,10 @@ impl SocksLocalRouter {
             match_entry
                 .map(|entry| (entry.dst_ip, entry.dst_port))
                 .ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::NotFound, "original destination not found")
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "original destination not found",
+                    )
                 })
         });
 
@@ -191,7 +200,11 @@ impl SocksLocalRouter {
         Ok(proxies.len() - 1)
     }
 
-    pub fn associate_process_name_to_proxy(&self, process_name: &str, proxy_id: usize) -> Result<()> {
+    pub fn associate_process_name_to_proxy(
+        &self,
+        process_name: &str,
+        proxy_id: usize,
+    ) -> Result<()> {
         let proxies = self.proxies.lock().unwrap();
         if proxy_id >= proxies.len() {
             return Err(anyhow!("proxy index is out of range"));
@@ -230,7 +243,8 @@ impl SocksLocalRouter {
         let router = Arc::clone(self);
 
         let thread = thread::spawn(move || {
-            if let Err(err) = run_packet_loop(DRIVER_NAME, adapter_name, shutdown, restart, router) {
+            if let Err(err) = run_packet_loop(DRIVER_NAME, adapter_name, shutdown, restart, router)
+            {
                 error!("packet loop exited with error: {err}");
             }
         });
@@ -363,7 +377,7 @@ impl SocksLocalRouter {
                 AF_UNSPEC,
                 Some(ip_interface_changed_callback),
                 Some(ctx),
-                true,
+                false,
                 &mut handle,
             )
         };
@@ -400,8 +414,8 @@ impl SocksLocalRouter {
         let new_name = select_best_adapter_name(&driver)?;
         let mut name = self.adapter_name.lock().unwrap();
         if *name != new_name {
-            let friendly = Ndisapi::get_friendly_adapter_name(&new_name)
-                .unwrap_or_else(|_| new_name.clone());
+            let friendly =
+                Ndisapi::get_friendly_adapter_name(&new_name).unwrap_or_else(|_| new_name.clone());
             info!("Detected default interface: {}", friendly);
             *name = new_name;
             return Ok(true);
@@ -640,14 +654,7 @@ impl SocksLocalRouter {
         let src = SocketAddr::new(src_ip_std, src_port);
         let dst = SocketAddr::new(dst_ip_std, dst_port);
         let rewrite = self.process_udp_payload(
-            "UDP",
-            src,
-            dst,
-            src_ip_std,
-            dst_ip_std,
-            src_port,
-            dst_port,
-            false,
+            "UDP", src, dst, src_ip_std, dst_ip_std, src_port, dst_port, false,
         );
         match rewrite {
             Some(PortRewrite::ToProxy(port)) => {
@@ -676,14 +683,7 @@ impl SocksLocalRouter {
         let src = SocketAddr::new(src_ip_std, src_port);
         let dst = SocketAddr::new(dst_ip_std, dst_port);
         let rewrite = self.process_udp_payload(
-            "UDPv6",
-            src,
-            dst,
-            src_ip_std,
-            dst_ip_std,
-            src_port,
-            dst_port,
-            true,
+            "UDPv6", src, dst, src_ip_std, dst_ip_std, src_port, dst_port, true,
         );
         match rewrite {
             Some(PortRewrite::ToProxy(port)) => {
@@ -989,9 +989,17 @@ fn build_proxy_pass_filter(
 
     let port_range = PortRange::new(port, port);
     let (src_range, dst_range, port_flag) = if match_src_port {
-        (port_range, PortRange::default(), TcpUdpFilterFlags::TCPUDP_SRC_PORT)
+        (
+            port_range,
+            PortRange::default(),
+            TcpUdpFilterFlags::TCPUDP_SRC_PORT,
+        )
     } else {
-        (PortRange::default(), port_range, TcpUdpFilterFlags::TCPUDP_DEST_PORT)
+        (
+            PortRange::default(),
+            port_range,
+            TcpUdpFilterFlags::TCPUDP_DEST_PORT,
+        )
     };
 
     StaticFilter::new(
@@ -1026,9 +1034,17 @@ fn build_proxy_pass_filter_v6(
 
     let port_range = PortRange::new(port, port);
     let (src_range, dst_range, port_flag) = if match_src_port {
-        (port_range, PortRange::default(), TcpUdpFilterFlags::TCPUDP_SRC_PORT)
+        (
+            port_range,
+            PortRange::default(),
+            TcpUdpFilterFlags::TCPUDP_SRC_PORT,
+        )
     } else {
-        (PortRange::default(), port_range, TcpUdpFilterFlags::TCPUDP_DEST_PORT)
+        (
+            PortRange::default(),
+            port_range,
+            TcpUdpFilterFlags::TCPUDP_DEST_PORT,
+        )
     };
 
     StaticFilter::new(
@@ -1192,9 +1208,14 @@ fn select_best_adapter_name(driver: &Ndisapi) -> Result<String> {
 
     let best_index = get_best_interface_index();
     if let Some(index) = best_index {
+        let mut mac_to_index = HashMap::new();
+        for info in IphlpNetworkAdapterInfo::get_external_network_connections() {
+            mac_to_index.insert(*info.physical_address(), info.if_index());
+        }
         if let Some(pos) = adapters.iter().position(|adapter| {
-            adapter_ip_info(adapter)
-                .map(|info| info.if_index() == index)
+            MacAddress::from_slice(adapter.get_hw_address())
+                .and_then(|mac| mac_to_index.get(&mac).copied())
+                .map(|if_index| if_index == index)
                 .unwrap_or(false)
         }) {
             let adapter = adapters.remove(pos);
@@ -1215,22 +1236,12 @@ fn find_adapter_handle(driver: &Ndisapi, adapter_name: &str) -> Result<HANDLE> {
     Err(anyhow!("adapter not found: {adapter_name}"))
 }
 
-fn adapter_ip_info(adapter: &NetworkAdapterInfo) -> Option<IphlpNetworkAdapterInfo> {
-    let mac = MacAddress::from_slice(adapter.get_hw_address())?;
-    IphlpNetworkAdapterInfo::get_connection_by_hw_address(&mac)
-}
-
 fn get_best_interface_index() -> Option<u32> {
     let dest = u32::from_be_bytes([8, 8, 8, 8]);
     let mut index = 0u32;
     let res = unsafe { GetBestInterface(dest, &mut index) };
-    if res == NO_ERROR.0 {
-        Some(index)
-    } else {
-        None
-    }
+    if res == NO_ERROR.0 { Some(index) } else { None }
 }
-
 
 fn normalize_mapped_ipv6(addr: SocketAddr) -> SocketAddr {
     match addr {
