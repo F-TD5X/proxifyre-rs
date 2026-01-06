@@ -1,6 +1,7 @@
-use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::time::Duration;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket, lookup_host};
 
 #[derive(Clone, Debug)]
 pub struct Socks5Dialer {
@@ -30,30 +31,29 @@ impl Socks5Dialer {
         self.proxy_addr
     }
 
-    pub fn connect_tcp(&self, dst: SocketAddr) -> io::Result<TcpStream> {
-        let mut stream = TcpStream::connect(self.proxy_addr)?;
-        stream.set_nodelay(true).ok();
-        handshake(&mut stream, self.auth.as_ref())?;
+    pub async fn connect_tcp(&self, dst: SocketAddr) -> io::Result<TcpStream> {
+        let mut stream = TcpStream::connect(self.proxy_addr).await?;
+        stream.set_nodelay(true)?;
+        handshake(&mut stream, self.auth.as_ref()).await?;
         let dst = maybe_map_ipv4_to_ipv6_mapped(dst, self.prefer_ipv4_mapped_ipv6);
-        send_request(&mut stream, Command::Connect, dst)?;
+        send_request(&mut stream, Command::Connect, dst).await?;
         Ok(stream)
     }
 
-    pub fn udp_associate(&self) -> io::Result<Socks5UdpAssociation> {
-        let mut stream = TcpStream::connect(self.proxy_addr)?;
-        stream.set_nodelay(true).ok();
-        handshake(&mut stream, self.auth.as_ref())?;
+    pub async fn udp_associate(&self) -> io::Result<Socks5UdpAssociation> {
+        let mut stream = TcpStream::connect(self.proxy_addr).await?;
+        stream.set_nodelay(true)?;
+        handshake(&mut stream, self.auth.as_ref()).await?;
         // Bind address 0.0.0.0:0 to let proxy pick the relay.
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-        let relay = send_request(&mut stream, Command::UdpAssociate, bind_addr)?;
+        let relay = send_request(&mut stream, Command::UdpAssociate, bind_addr).await?;
         let relay = normalize_udp_relay(relay, self.proxy_addr);
 
         let udp = match relay {
-            SocketAddr::V4(_) => UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?,
-            SocketAddr::V6(_) => UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))?,
+            SocketAddr::V4(_) => UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?,
+            SocketAddr::V6(_) => UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).await?,
         };
-        udp.connect(relay)?;
-        udp.set_read_timeout(Some(Duration::from_millis(500)))?;
+        udp.connect(relay).await?;
 
         Ok(Socks5UdpAssociation {
             udp,
@@ -70,19 +70,14 @@ pub struct Socks5UdpAssociation {
 }
 
 impl Socks5UdpAssociation {
-    pub fn send_to(&self, payload: &[u8], dst: SocketAddr) -> io::Result<usize> {
+    pub async fn send_to(&self, payload: &[u8], dst: SocketAddr) -> io::Result<usize> {
         let dst = maybe_map_ipv4_to_ipv6_mapped(dst, self.prefer_ipv4_mapped_ipv6);
         let buf = build_udp_request(dst, payload);
-        self.udp.send(&buf)
+        self.udp.send(&buf).await
     }
 
-    pub fn recv_datagram(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let n = match self.udp.recv(buf) {
-            Ok(n) => n,
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Err(err),
-            Err(err) => return Err(err),
-        };
-
+    pub async fn recv_datagram(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let n = self.udp.recv(buf).await?;
         let (payload_offset, addr) = parse_udp_response(&buf[..n])?;
         let payload_len = n.saturating_sub(payload_offset);
         buf.copy_within(payload_offset..n, 0);
@@ -207,21 +202,21 @@ fn split_host_port(input: &str) -> io::Result<(&str, &str)> {
     Ok((&input[..pos], &input[pos + 1..]))
 }
 
-fn handshake(stream: &mut TcpStream, auth: Option<&Socks5Auth>) -> io::Result<()> {
+async fn handshake(stream: &mut TcpStream, auth: Option<&Socks5Auth>) -> io::Result<()> {
     if auth.is_some() {
-        stream.write_all(&[0x05, 0x02, 0x00, 0x02])?;
+        stream.write_all(&[0x05, 0x02, 0x00, 0x02]).await?;
     } else {
-        stream.write_all(&[0x05, 0x01, 0x00])?;
+        stream.write_all(&[0x05, 0x01, 0x00]).await?;
     }
 
     let mut resp = [0u8; 2];
-    stream.read_exact(&mut resp)?;
+    stream.read_exact(&mut resp).await?;
     if resp[0] != 0x05 || resp[1] != 0x00 {
         match resp[1] {
             0x02 => {
                 let auth = auth
                     .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "SOCKS5 auth required"))?;
-                username_password_auth(stream, auth)?;
+                username_password_auth(stream, auth).await?;
                 return Ok(());
             }
             0xFF => {
@@ -241,7 +236,7 @@ fn handshake(stream: &mut TcpStream, auth: Option<&Socks5Auth>) -> io::Result<()
     Ok(())
 }
 
-fn username_password_auth(stream: &mut TcpStream, auth: &Socks5Auth) -> io::Result<()> {
+async fn username_password_auth(stream: &mut TcpStream, auth: &Socks5Auth) -> io::Result<()> {
     let username = auth.username.as_bytes();
     let password = auth.password.as_bytes();
     if username.len() > u8::MAX as usize || password.len() > u8::MAX as usize {
@@ -257,10 +252,10 @@ fn username_password_auth(stream: &mut TcpStream, auth: &Socks5Auth) -> io::Resu
     buf.extend_from_slice(username);
     buf.push(password.len() as u8);
     buf.extend_from_slice(password);
-    stream.write_all(&buf)?;
+    stream.write_all(&buf).await?;
 
     let mut resp = [0u8; 2];
-    stream.read_exact(&mut resp)?;
+    stream.read_exact(&mut resp).await?;
     if resp[0] != 0x01 || resp[1] != 0x00 {
         return Err(io::Error::new(
             io::ErrorKind::Other,
@@ -270,20 +265,24 @@ fn username_password_auth(stream: &mut TcpStream, auth: &Socks5Auth) -> io::Resu
     Ok(())
 }
 
-fn send_request(stream: &mut TcpStream, cmd: Command, dst: SocketAddr) -> io::Result<SocketAddr> {
+async fn send_request(
+    stream: &mut TcpStream,
+    cmd: Command,
+    dst: SocketAddr,
+) -> io::Result<SocketAddr> {
     let mut req = Vec::with_capacity(32);
     req.push(0x05);
     req.push(cmd.as_byte());
     req.push(0x00);
     encode_addr(&mut req, dst);
-    stream.write_all(&req)?;
+    stream.write_all(&req).await?;
 
-    read_reply(stream)
+    read_reply(stream).await
 }
 
-fn read_reply(stream: &mut TcpStream) -> io::Result<SocketAddr> {
+async fn read_reply(stream: &mut TcpStream) -> io::Result<SocketAddr> {
     let mut header = [0u8; 4];
-    stream.read_exact(&mut header)?;
+    stream.read_exact(&mut header).await?;
     if header[0] != 0x05 {
         return Err(io::Error::new(
             io::ErrorKind::Other,
@@ -298,35 +297,34 @@ fn read_reply(stream: &mut TcpStream) -> io::Result<SocketAddr> {
     }
 
     let atyp = header[3];
-    read_addr_with_atyp(stream, atyp)
+    read_addr_with_atyp(stream, atyp).await
 }
 
-fn read_addr_with_atyp(stream: &mut TcpStream, atyp: u8) -> io::Result<SocketAddr> {
+async fn read_addr_with_atyp(stream: &mut TcpStream, atyp: u8) -> io::Result<SocketAddr> {
     match atyp {
         0x01 => {
             let mut addr = [0u8; 4];
-            stream.read_exact(&mut addr)?;
-            let port = read_port(stream)?;
+            stream.read_exact(&mut addr).await?;
+            let port = read_port(stream).await?;
             Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(addr)), port))
         }
         0x04 => {
             let mut addr = [0u8; 16];
-            stream.read_exact(&mut addr)?;
-            let port = read_port(stream)?;
+            stream.read_exact(&mut addr).await?;
+            let port = read_port(stream).await?;
             Ok(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(addr)), port))
         }
         0x03 => {
             let mut len = [0u8; 1];
-            stream.read_exact(&mut len)?;
+            stream.read_exact(&mut len).await?;
             let mut host = vec![0u8; len[0] as usize];
-            stream.read_exact(&mut host)?;
-            let port = read_port(stream)?;
+            stream.read_exact(&mut host).await?;
+            let port = read_port(stream).await?;
             let host = String::from_utf8_lossy(&host).to_string();
-            let resolved = (host.as_str(), port)
-                .to_socket_addrs()?
+            let mut resolved = lookup_host((host.as_str(), port)).await?;
+            resolved
                 .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "failed to resolve host"))?;
-            Ok(resolved)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "failed to resolve host"))
         }
         _ => Err(io::Error::new(
             io::ErrorKind::Other,
@@ -335,9 +333,9 @@ fn read_addr_with_atyp(stream: &mut TcpStream, atyp: u8) -> io::Result<SocketAdd
     }
 }
 
-fn read_port(stream: &mut TcpStream) -> io::Result<u16> {
+async fn read_port(stream: &mut TcpStream) -> io::Result<u16> {
     let mut port_bytes = [0u8; 2];
-    stream.read_exact(&mut port_bytes)?;
+    stream.read_exact(&mut port_bytes).await?;
     Ok(u16::from_be_bytes(port_bytes))
 }
 
@@ -438,7 +436,7 @@ fn parse_udp_response(buf: &[u8]) -> io::Result<(usize, SocketAddr)> {
             offset += len;
             let port = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
             offset += 2;
-            let resolved = (host.as_str(), port)
+            let resolved = format!("{host}:{port}")
                 .to_socket_addrs()?
                 .next()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "failed to resolve domain"))?;

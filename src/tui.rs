@@ -1,4 +1,5 @@
 use crate::router::SocksLocalRouter;
+use crate::windows::stats::{StatsSnapshot, SystemStats};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -16,26 +17,31 @@ use std::io::stdout;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::FILETIME;
-use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::task;
 
 pub struct TuiState {
     pub logs: Arc<Mutex<Vec<String>>>,
     pub router: Arc<SocksLocalRouter>,
     shutdown: AtomicBool,
-    cpu_sampler: Mutex<CpuSampler>,
     traffic_sampler: Mutex<TrafficSampler>,
+    stats: Arc<dyn SystemStats>,
+    last_stats: AsyncMutex<StatsSnapshot>,
 }
 
 impl TuiState {
-    pub fn new(router: Arc<SocksLocalRouter>, logs: Arc<Mutex<Vec<String>>>) -> Self {
+    pub fn new(
+        router: Arc<SocksLocalRouter>,
+        logs: Arc<Mutex<Vec<String>>>,
+        stats: Arc<dyn SystemStats>,
+    ) -> Self {
         Self {
             logs,
             router,
             shutdown: AtomicBool::new(false),
-            cpu_sampler: Mutex::new(CpuSampler::new()),
             traffic_sampler: Mutex::new(TrafficSampler::new(Duration::from_secs(5))),
+            stats,
+            last_stats: AsyncMutex::new(StatsSnapshot::default()),
         }
     }
 
@@ -67,10 +73,14 @@ impl TuiState {
         format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
     }
 
-    pub fn get_process_usage(&self) -> (f64, u64) {
-        let cpu = self.cpu_sampler.lock().unwrap().sample().clamp(0.0, 100.0);
-        let mem = get_process_memory_bytes().unwrap_or(0);
-        (cpu, mem)
+    pub async fn refresh_stats(&self) {
+        let snapshot = self.stats.sample().await;
+        *self.last_stats.lock().await = snapshot;
+    }
+
+    pub async fn get_process_usage(&self) -> (f64, u64) {
+        let snapshot = *self.last_stats.lock().await;
+        (snapshot.cpu_percent, snapshot.mem_bytes)
     }
 
     pub fn get_traffic_rates(&self, bytes_sent: u64, bytes_received: u64) -> (f64, f64) {
@@ -83,6 +93,20 @@ impl TuiState {
     pub fn format_rate(&self, bytes_per_sec: f64) -> String {
         let rounded = bytes_per_sec.round().max(0.0) as u64;
         format!("{}/s", self.format_bytes(rounded))
+    }
+
+    pub fn start_stats_task(self: &Arc<Self>) -> task::JoinHandle<()> {
+        let state = Arc::clone(self);
+        task::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                if state.should_shutdown() {
+                    break;
+                }
+                state.refresh_stats().await;
+            }
+        })
     }
 }
 
@@ -166,7 +190,11 @@ impl Tui {
         let bytes_sent = self.state.router.get_bytes_sent();
         let bytes_received = self.state.router.get_bytes_received();
         let running_time = self.state.router.get_running_time();
-        let (cpu_percent, mem_bytes) = self.state.get_process_usage();
+
+        let stats = self.state.last_stats.blocking_lock();
+        let cpu_percent = stats.cpu_percent;
+        let mem_bytes = stats.mem_bytes;
+
         let (up_rate, down_rate) = self.state.get_traffic_rates(bytes_sent, bytes_received);
 
         let tcp_str = format!("{}", tcp_count);
@@ -198,85 +226,6 @@ impl Tui {
 
         frame.render_widget(paragraph, area);
     }
-}
-
-struct CpuSampler {
-    last_instant: Instant,
-    last_process_100ns: u64,
-}
-
-impl CpuSampler {
-    fn new() -> Self {
-        Self {
-            last_instant: Instant::now(),
-            last_process_100ns: 0,
-        }
-    }
-
-    fn sample(&mut self) -> f64 {
-        let now = Instant::now();
-        let process_time = match get_process_time_100ns() {
-            Some(value) => value,
-            None => return 0.0,
-        };
-
-        if self.last_process_100ns == 0 {
-            self.last_process_100ns = process_time;
-            self.last_instant = now;
-            return 0.0;
-        }
-
-        let delta_process = process_time.saturating_sub(self.last_process_100ns);
-        let delta_wall = now.duration_since(self.last_instant);
-        if delta_wall.is_zero() {
-            return 0.0;
-        }
-
-        let wall_100ns = (delta_wall.as_nanos() / 100) as u64;
-        if wall_100ns == 0 {
-            return 0.0;
-        }
-
-        let cpu_count = std::thread::available_parallelism()
-            .map(|count| count.get() as u64)
-            .unwrap_or(1);
-
-        self.last_process_100ns = process_time;
-        self.last_instant = now;
-
-        (delta_process as f64 / wall_100ns as f64) * 100.0 / cpu_count as f64
-    }
-}
-
-fn filetime_to_u64(filetime: FILETIME) -> u64 {
-    ((filetime.dwHighDateTime as u64) << 32) | filetime.dwLowDateTime as u64
-}
-
-fn get_process_time_100ns() -> Option<u64> {
-    let mut creation = FILETIME::default();
-    let mut exit = FILETIME::default();
-    let mut kernel = FILETIME::default();
-    let mut user = FILETIME::default();
-    unsafe {
-        GetProcessTimes(
-            GetCurrentProcess(),
-            &mut creation,
-            &mut exit,
-            &mut kernel,
-            &mut user,
-        )
-        .ok()?;
-    }
-    Some(filetime_to_u64(kernel) + filetime_to_u64(user))
-}
-
-fn get_process_memory_bytes() -> Option<u64> {
-    let mut counters = PROCESS_MEMORY_COUNTERS::default();
-    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-    unsafe {
-        GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb).ok()?;
-    }
-    Some(counters.WorkingSetSize as u64)
 }
 
 struct TrafficSample {

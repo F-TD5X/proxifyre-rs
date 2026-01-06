@@ -12,7 +12,7 @@ targets = ["x86_64-pc-windows-msvc"]
 # Core networking
 ipnetwork = "0.20"
 socket2 = "0.5"
-tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net", "io-util"] }
 
 # Windows-specific
 ndisapi = "0.6.5"
@@ -34,6 +34,7 @@ unicode-width = "0.1"
 
 # Utilities
 anyhow = "1.0"
+async-trait = "0.1"
 chrono = "0.4"
 humantime = "2.1"
 log = "0.4"
