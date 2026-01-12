@@ -33,7 +33,9 @@ const MAX_STATIC_FILTERS: usize = 256;
 pub struct SocksLocalRouter {
     adapter_name: Arc<Mutex<String>>,
     process_lookup: Arc<dyn ProcessLookup>,
+    #[allow(clippy::type_complexity)]
     tcp_connections: Arc<Mutex<HashMap<(IpAddr, IpAddr, u16), TcpPortMapping>>>,
+    #[allow(clippy::type_complexity)]
     udp_endpoints: Arc<Mutex<HashMap<(IpAddr, IpAddr, u16), UdpPortMapping>>>,
     proxies: Arc<Mutex<Vec<Arc<TransparentProxy>>>>,
     name_to_proxy: Arc<Mutex<HashMap<String, usize>>>,
@@ -56,8 +58,7 @@ impl SocksLocalRouter {
             .unwrap_or_else(|_| adapter_name.clone());
         info!("Using adapter: {}", friendly);
 
-        let mut filters = Vec::new();
-        filters.push(build_icmp_pass_filter());
+        let filters = vec![build_icmp_pass_filter()];
 
         Ok(Self {
             adapter_name: Arc::new(Mutex::new(adapter_name)),
@@ -226,7 +227,8 @@ impl SocksLocalRouter {
         self.restart.store(false, Ordering::Relaxed);
         self.cancel_interface_change_notifications();
 
-        if let Some(task) = self.packet_task.lock().unwrap().take() {
+        let task = self.packet_task.lock().unwrap().take();
+        if let Some(task) = task {
             let _ = task.await;
         }
 

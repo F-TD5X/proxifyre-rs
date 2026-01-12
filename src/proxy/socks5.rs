@@ -214,22 +214,15 @@ async fn handshake(stream: &mut TcpStream, auth: Option<&Socks5Auth>) -> io::Res
     if resp[0] != 0x05 || resp[1] != 0x00 {
         match resp[1] {
             0x02 => {
-                let auth = auth
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "SOCKS5 auth required"))?;
+                let auth = auth.ok_or_else(|| io::Error::other("SOCKS5 auth required"))?;
                 username_password_auth(stream, auth).await?;
                 return Ok(());
             }
             0xFF => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "SOCKS5 auth methods rejected",
-                ));
+                return Err(io::Error::other("SOCKS5 auth methods rejected"));
             }
             _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("SOCKS5 auth failed: {resp:?}"),
-                ));
+                return Err(io::Error::other(format!("SOCKS5 auth failed: {resp:?}")));
             }
         }
     }
@@ -257,10 +250,7 @@ async fn username_password_auth(stream: &mut TcpStream, auth: &Socks5Auth) -> io
     let mut resp = [0u8; 2];
     stream.read_exact(&mut resp).await?;
     if resp[0] != 0x01 || resp[1] != 0x00 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "SOCKS5 username/password auth failed",
-        ));
+        return Err(io::Error::other("SOCKS5 username/password auth failed"));
     }
     Ok(())
 }
@@ -284,16 +274,16 @@ async fn read_reply(stream: &mut TcpStream) -> io::Result<SocketAddr> {
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).await?;
     if header[0] != 0x05 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("invalid SOCKS5 response version: {}", header[0]),
-        ));
+        return Err(io::Error::other(format!(
+            "invalid SOCKS5 response version: {}",
+            header[0]
+        )));
     }
     if header[1] != 0x00 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("SOCKS5 request failed with code: {}", header[1]),
-        ));
+        return Err(io::Error::other(format!(
+            "SOCKS5 request failed with code: {}",
+            header[1]
+        )));
     }
 
     let atyp = header[3];
@@ -324,12 +314,11 @@ async fn read_addr_with_atyp(stream: &mut TcpStream, atyp: u8) -> io::Result<Soc
             let mut resolved = lookup_host((host.as_str(), port)).await?;
             resolved
                 .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "failed to resolve host"))
+                .ok_or_else(|| io::Error::other("failed to resolve host"))
         }
-        _ => Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("unsupported SOCKS5 address type: {atyp}"),
-        )),
+        _ => Err(io::Error::other(format!(
+            "unsupported SOCKS5 address type: {atyp}"
+        ))),
     }
 }
 
@@ -436,11 +425,10 @@ fn parse_udp_response(buf: &[u8]) -> io::Result<(usize, SocketAddr)> {
             offset += len;
             let port = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
             offset += 2;
-            let resolved = format!("{host}:{port}")
+            format!("{host}:{port}")
                 .to_socket_addrs()?
                 .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "failed to resolve domain"))?;
-            resolved
+                .ok_or_else(|| io::Error::other("failed to resolve domain"))?
         }
         _ => {
             return Err(io::Error::new(

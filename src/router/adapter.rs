@@ -25,6 +25,7 @@ pub(super) async fn run_packet_loop(
 ) -> Result<()> {
     loop {
         let adapter_name = adapter_name.lock().unwrap().clone();
+        #[allow(clippy::arc_with_non_send_sync)]
         let driver = Arc::new(Ndisapi::new(driver_name)?);
         let adapter_handle = match find_adapter_handle(driver.as_ref(), &adapter_name) {
             Ok(handle) => handle,

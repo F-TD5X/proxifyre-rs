@@ -134,20 +134,19 @@ impl Tui {
 
             terminal.draw(|frame| self.draw(frame))?;
 
-            if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        if key.code == KeyCode::Char('c')
-                            && key.modifiers.contains(event::KeyModifiers::CONTROL)
-                        {
-                            self.state.request_shutdown();
-                            break;
-                        }
-                        if key.code == KeyCode::Char('q') {
-                            self.state.request_shutdown();
-                            break;
-                        }
-                    }
+            if event::poll(Duration::from_millis(100))?
+                && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                if key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(event::KeyModifiers::CONTROL)
+                {
+                    self.state.request_shutdown();
+                    break;
+                }
+                if key.code == KeyCode::Char('q') {
+                    self.state.request_shutdown();
+                    break;
                 }
             }
         }

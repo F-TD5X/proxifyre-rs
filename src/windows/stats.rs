@@ -122,8 +122,10 @@ fn get_process_time_100ns() -> Option<u64> {
 }
 
 fn get_process_memory_bytes() -> Option<u64> {
-    let mut counters = PROCESS_MEMORY_COUNTERS::default();
-    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
     unsafe {
         GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb).ok()?;
     }

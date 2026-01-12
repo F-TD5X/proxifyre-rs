@@ -27,14 +27,14 @@ impl SocksLocalRouter {
         let map = self.name_to_proxy.lock().unwrap();
         let proxies = self.proxies.lock().unwrap();
         for (name, proxy_id) in map.iter() {
-            if process_path.contains(name) {
-                if let Some(proxy) = proxies.get(*proxy_id) {
-                    return if is_v6 {
-                        proxy.get_local_tcp_proxy_port_v6()
-                    } else {
-                        proxy.get_local_tcp_proxy_port_v4()
-                    };
-                }
+            if process_path.contains(name)
+                && let Some(proxy) = proxies.get(*proxy_id)
+            {
+                return if is_v6 {
+                    proxy.get_local_tcp_proxy_port_v6()
+                } else {
+                    proxy.get_local_tcp_proxy_port_v4()
+                };
             }
         }
         0
@@ -44,14 +44,14 @@ impl SocksLocalRouter {
         let map = self.name_to_proxy.lock().unwrap();
         let proxies = self.proxies.lock().unwrap();
         for (name, proxy_id) in map.iter() {
-            if process_path.contains(name) {
-                if let Some(proxy) = proxies.get(*proxy_id) {
-                    return if is_v6 {
-                        proxy.get_local_udp_proxy_port_v6()
-                    } else {
-                        proxy.get_local_udp_proxy_port_v4()
-                    };
-                }
+            if process_path.contains(name)
+                && let Some(proxy) = proxies.get(*proxy_id)
+            {
+                return if is_v6 {
+                    proxy.get_local_udp_proxy_port_v6()
+                } else {
+                    proxy.get_local_udp_proxy_port_v4()
+                };
             }
         }
         0
@@ -73,6 +73,8 @@ impl SocksLocalRouter {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn process_tcp_payload(
         &self,
         label: &str,
@@ -142,6 +144,8 @@ impl SocksLocalRouter {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn process_udp_payload(
         &self,
         label: &str,
@@ -158,37 +162,42 @@ impl SocksLocalRouter {
         let now = Instant::now();
 
         let key = (dst_ip_std, src_ip_std, src_port);
+
+        // Check for existing UDP mapping
         {
             let mut map = self.udp_endpoints.lock().unwrap();
             if let Some(entry) = map.get(&key).cloned() {
                 if entry.dst_port == dst_port {
-                    redirected = true;
-                    proxy_port = entry.proxy_port;
                     if let Some(e) = map.get_mut(&key) {
                         e.last_active = now;
                     }
+                    return Some(PortRewrite::ToProxy(entry.proxy_port));
                 } else {
                     return None;
                 }
-            } else if let Ok(path) = self.process_lookup.find_process_path(true, src, dst).await {
-                proxy_port = self.get_proxy_port_udp(&path, is_v6);
-                if proxy_port != 0 {
-                    map.insert(
-                        key,
-                        UdpPortMapping {
-                            dst_ip: dst_ip_std,
-                            dst_port,
-                            proxy_port,
-                            last_active: now,
-                        },
-                    );
-                    redirected = true;
-                    let process_label = format_process_label(&path);
-                    info!(
-                        "[{}] [PROXY] {} {} -> {} (redirect to {})",
-                        label, process_label, src, dst, proxy_port
-                    );
-                }
+            }
+        }
+
+        // No mapping found, perform process lookup (async, no lock held)
+        if let Ok(path) = self.process_lookup.find_process_path(true, src, dst).await {
+            proxy_port = self.get_proxy_port_udp(&path, is_v6);
+            if proxy_port != 0 {
+                let mut map = self.udp_endpoints.lock().unwrap();
+                map.insert(
+                    key,
+                    UdpPortMapping {
+                        dst_ip: dst_ip_std,
+                        dst_port,
+                        proxy_port,
+                        last_active: now,
+                    },
+                );
+                redirected = true;
+                let process_label = format_process_label(&path);
+                info!(
+                    "[{}] [PROXY] {} {} -> {} (redirect to {})",
+                    label, process_label, src, dst, proxy_port
+                );
             }
         }
 
