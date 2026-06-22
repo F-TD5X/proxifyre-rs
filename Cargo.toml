@@ -10,12 +10,12 @@ targets = ["x86_64-pc-windows-msvc"]
 [dependencies]
 
 # Core networking
-ipnetwork = "0.20"
-socket2 = "0.5"
-tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net", "io-util"] }
+ipnetwork = "0.21.1"
+socket2 = "0.6.4"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net", "io-util"] }
 
 # Windows-specific
-ndisapi = "0.6.5"
+ndisapi = "0.6.6"
 windows = { version = "0.62.2", features = [
   "Win32_Foundation",
   "Win32_NetworkManagement_IpHelper",
@@ -25,21 +25,21 @@ windows = { version = "0.62.2", features = [
 ] }
 
 # Packet parsing
-smoltcp = { version = "0.11", default-features = false, features = ["proto-ipv4", "proto-ipv6", "std", "medium-ethernet", "socket-udp"] }
+smoltcp = { version = "0.13.1", default-features = false, features = ["proto-ipv4", "proto-ipv6", "std", "medium-ethernet", "socket-udp"] }
 
 # CLI/TUI
-crossterm = "0.28"
-ratatui = "0.28"
-unicode-width = "0.1"
+crossterm = "0.29.0"
+ratatui = "0.30.2"
+unicode-width = "0.2.2"
 
 # Utilities
-anyhow = "1.0"
-async-trait = "0.1"
-chrono = "0.4"
-humantime = "2.1"
-log = "0.4"
-serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+chrono = "0.4.45"
+humantime = "2.3.0"
+log = "0.4.33"
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.1.2"
 
 [profile.release]
 opt-level = 3

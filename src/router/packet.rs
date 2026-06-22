@@ -4,7 +4,7 @@ use smoltcp::wire::{
     EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket,
     UdpPacket,
 };
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ProxyDirection {
@@ -125,8 +125,8 @@ fn parse_ipv4(frame: &mut EthernetFrame<&mut [u8]>) -> Option<PacketInfo> {
         Err(_) => return None,
     };
 
-    let src_ip = IpAddr::V4(Ipv4Addr::from(ipv4.src_addr()));
-    let dst_ip = IpAddr::V4(Ipv4Addr::from(ipv4.dst_addr()));
+    let src_ip = IpAddr::V4(ipv4.src_addr());
+    let dst_ip = IpAddr::V4(ipv4.dst_addr());
 
     match ipv4.next_header() {
         IpProtocol::Tcp => {
@@ -171,8 +171,8 @@ fn parse_ipv6(frame: &mut EthernetFrame<&mut [u8]>) -> Option<PacketInfo> {
         Err(_) => return None,
     };
 
-    let src_ip = IpAddr::V6(Ipv6Addr::from(ipv6.src_addr()));
-    let dst_ip = IpAddr::V6(Ipv6Addr::from(ipv6.dst_addr()));
+    let src_ip = IpAddr::V6(ipv6.src_addr());
+    let dst_ip = IpAddr::V6(ipv6.dst_addr());
 
     match ipv6.next_header() {
         IpProtocol::Tcp => {
