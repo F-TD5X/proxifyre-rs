@@ -29,8 +29,6 @@ coverage/
 *.rlib
 
 .serena
-CLAUDE.md
-AGENTS.md
 
 .codanna/
 .codannaignore
