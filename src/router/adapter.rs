@@ -43,12 +43,15 @@ pub(super) async fn run_packet_loop(
         adapter.set_adapter_mode(FilterFlags::MSTCP_FLAG_SENT_RECEIVE_TUNNEL)?;
 
         let mut packets = vec![IntermediateBuffer::default(); PACKET_NUMBER];
+        let mut routing = Vec::with_capacity(PACKET_NUMBER);
         let mut cleanup_counter = 0u32;
 
         while !shutdown.load(Ordering::Relaxed) {
             if restart.swap(false, Ordering::Relaxed) {
                 break;
             }
+
+            routing.clear();
 
             let packets_read = match adapter.read_packets::<PACKET_NUMBER>(&mut packets).await {
                 Ok(packets_read) => packets_read,
@@ -60,10 +63,6 @@ pub(super) async fn run_packet_loop(
             if packets_read == 0 {
                 continue;
             }
-
-            let mut send_to_adapter = Vec::with_capacity(packets_read);
-            let mut send_to_mstcp = Vec::with_capacity(packets_read);
-            let mut routing = Vec::with_capacity(packets_read);
 
             for packet in packets[..packets_read].iter_mut() {
                 let proxy_direction = router.process_packet(packet).await;
@@ -87,19 +86,20 @@ pub(super) async fn run_packet_loop(
                 routing.push(send_to_adapter);
             }
 
-            for (packet, to_adapter) in packets[..packets_read].iter().zip(routing.into_iter()) {
-                if to_adapter {
-                    send_to_adapter.push(packet);
-                } else {
-                    send_to_mstcp.push(packet);
-                }
-            }
-
-            if !send_to_adapter.is_empty() {
+            let adapter_count = routing.iter().filter(|to_adapter| **to_adapter).count();
+            if adapter_count != 0 {
+                let send_to_adapter = packets[..packets_read]
+                    .iter()
+                    .zip(routing.iter().copied())
+                    .filter_map(|(packet, to_adapter)| to_adapter.then_some(packet));
                 let _ = adapter.send_packets_to_adapter::<PACKET_NUMBER>(send_to_adapter);
             }
 
-            if !send_to_mstcp.is_empty() {
+            if adapter_count != packets_read {
+                let send_to_mstcp = packets[..packets_read]
+                    .iter()
+                    .zip(routing.iter().copied())
+                    .filter_map(|(packet, to_adapter)| (!to_adapter).then_some(packet));
                 let _ = adapter.send_packets_to_mstcp::<PACKET_NUMBER>(send_to_mstcp);
             }
 

@@ -70,10 +70,15 @@ pub struct Socks5UdpAssociation {
 }
 
 impl Socks5UdpAssociation {
-    pub async fn send_to(&self, payload: &[u8], dst: SocketAddr) -> io::Result<usize> {
+    pub async fn send_to(
+        &self,
+        buf: &mut Vec<u8>,
+        payload: &[u8],
+        dst: SocketAddr,
+    ) -> io::Result<usize> {
         let dst = maybe_map_ipv4_to_ipv6_mapped(dst, self.prefer_ipv4_mapped_ipv6);
-        let buf = build_udp_request(dst, payload);
-        self.udp.send(&buf).await
+        build_udp_request(buf, dst, payload);
+        self.udp.send(buf).await
     }
 
     pub async fn recv_datagram(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
@@ -343,12 +348,12 @@ fn encode_addr(buf: &mut Vec<u8>, addr: SocketAddr) {
     }
 }
 
-fn build_udp_request(dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(payload.len() + 32);
+fn build_udp_request(buf: &mut Vec<u8>, dst: SocketAddr, payload: &[u8]) {
+    buf.clear();
+    buf.reserve(payload.len() + 32);
     buf.extend_from_slice(&[0x00, 0x00, 0x00]);
-    encode_addr(&mut buf, dst);
+    encode_addr(buf, dst);
     buf.extend_from_slice(payload);
-    buf
 }
 
 fn parse_udp_response(buf: &[u8]) -> io::Result<(usize, SocketAddr)> {

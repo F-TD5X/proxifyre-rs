@@ -21,7 +21,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task;
 
 pub struct TuiState {
-    pub logs: Arc<Mutex<Vec<String>>>,
+    pub logs: Arc<Mutex<VecDeque<String>>>,
     pub router: Arc<SocksLocalRouter>,
     shutdown: AtomicBool,
     traffic_sampler: Mutex<TrafficSampler>,
@@ -32,7 +32,7 @@ pub struct TuiState {
 impl TuiState {
     pub fn new(
         router: Arc<SocksLocalRouter>,
-        logs: Arc<Mutex<Vec<String>>>,
+        logs: Arc<Mutex<VecDeque<String>>>,
         stats: Arc<dyn SystemStats>,
     ) -> Self {
         Self {

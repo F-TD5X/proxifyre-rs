@@ -7,6 +7,35 @@ use std::time::{Duration, Instant};
 
 pub(super) const UDP_TIMEOUT_SECS: u64 = 60;
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct UdpFlowKey {
+    pub(super) dst_ip: IpAddr,
+    pub(super) src_ip: IpAddr,
+    pub(super) src_port: u16,
+}
+
+impl UdpFlowKey {
+    pub(super) fn new(dst_ip: IpAddr, src_ip: IpAddr, src_port: u16) -> Self {
+        Self {
+            dst_ip,
+            src_ip,
+            src_port,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct UdpIndexKey {
+    pub(super) dst_ip: IpAddr,
+    pub(super) src_port: u16,
+}
+
+impl UdpIndexKey {
+    pub(super) fn new(dst_ip: IpAddr, src_port: u16) -> Self {
+        Self { dst_ip, src_port }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct TcpPortMapping {
     pub(super) dst_ip: IpAddr,
@@ -161,16 +190,14 @@ impl SocksLocalRouter {
         let mut proxy_port = 0u16;
         let now = Instant::now();
 
-        let key = (dst_ip_std, src_ip_std, src_port);
+        let key = UdpFlowKey::new(dst_ip_std, src_ip_std, src_port);
 
         // Check for existing UDP mapping
         {
             let mut map = self.udp_endpoints.lock().unwrap();
-            if let Some(entry) = map.get(&key).cloned() {
+            if let Some(entry) = map.by_flow.get_mut(&key) {
                 if entry.dst_port == dst_port {
-                    if let Some(e) = map.get_mut(&key) {
-                        e.last_active = now;
-                    }
+                    entry.last_active = now;
                     return Some(PortRewrite::ToProxy(entry.proxy_port));
                 } else {
                     return None;
@@ -206,9 +233,9 @@ impl SocksLocalRouter {
         }
 
         if self.is_udp_proxy_port(src_port) {
-            let key = (dst_ip_std, src_ip_std, dst_port);
+            let key = UdpFlowKey::new(dst_ip_std, src_ip_std, dst_port);
             let map = self.udp_endpoints.lock().unwrap();
-            if let Some(entry) = map.get(&key).cloned() {
+            if let Some(entry) = map.by_flow.get(&key) {
                 return Some(PortRewrite::FromProxy(entry.dst_port));
             }
         }
@@ -220,7 +247,7 @@ impl SocksLocalRouter {
         let timeout = Duration::from_secs(UDP_TIMEOUT_SECS);
         let now = Instant::now();
         let mut map = self.udp_endpoints.lock().unwrap();
-        map.retain(|_, entry| now.duration_since(entry.last_active) < timeout);
+        map.retain_active(|entry| now.duration_since(entry.last_active) < timeout);
     }
 }
 

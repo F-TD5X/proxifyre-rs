@@ -4,8 +4,8 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -20,6 +20,9 @@ pub type QueryUdpRemotePeer =
 
 const UDP_QUEUE_SIZE: usize = 1024;
 const UDP_ASSOCIATION_TIMEOUT_SECS: u64 = 120;
+const MAX_UDP_ASSOCIATIONS: usize = 1024;
+const UDP_DATAGRAM_BUFFER_SIZE: usize = 65535;
+const UDP_PACKET_POOL_MAX: usize = UDP_QUEUE_SIZE + 2;
 
 pub struct TransparentProxy {
     port: u16,
@@ -32,7 +35,8 @@ pub struct TransparentProxy {
     shutdown_notify: Arc<Notify>,
     query_tcp_remote_peer: QueryTcpRemotePeer,
     query_udp_remote_peer: QueryUdpRemotePeer,
-    udp_connections: Arc<Mutex<HashMap<String, UdpAssociationEntry>>>,
+    udp_connections: Arc<Mutex<HashMap<UdpAssociationKey, UdpAssociationEntry>>>,
+    udp_packet_buffers: Arc<UdpPacketBufferPool>,
     handles: Mutex<Vec<JoinHandle<()>>>,
     udp_reader_handles: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -56,6 +60,7 @@ impl TransparentProxy {
             query_tcp_remote_peer,
             query_udp_remote_peer,
             udp_connections: Arc::new(Mutex::new(HashMap::new())),
+            udp_packet_buffers: Arc::new(UdpPacketBufferPool::new()),
             handles: Mutex::new(Vec::new()),
             udp_reader_handles: Mutex::new(Vec::new()),
         }
@@ -202,27 +207,31 @@ impl TransparentProxy {
         listener: Arc<UdpSocket>,
         tx: mpsc::Sender<UdpPacket>,
     ) {
-        let mut buf = vec![0u8; 65535];
-
         loop {
+            let mut packet = self.udp_packet_buffers.take();
             tokio::select! {
                 _ = self.shutdown_notify.notified() => {
+                    self.udp_packet_buffers.put(packet);
                     break;
                 }
-                res = listener.recv_from(&mut buf) => {
+                res = listener.recv_from(&mut packet) => {
                     match res {
                         Ok((n, client_addr)) => {
-                            let packet = buf[..n].to_vec();
-                            if let Err(err) = tx.try_send(UdpPacket { packet, client_addr }) {
+                            if let Err(err) = tx.try_send(UdpPacket { packet, packet_len: n, client_addr }) {
                                 match err {
-                                    mpsc::error::TrySendError::Full(_) => {
+                                    mpsc::error::TrySendError::Full(packet) => {
+                                        self.udp_packet_buffers.put(packet.packet);
                                         warn!("dropping UDP packet (queue full)");
                                     }
-                                    mpsc::error::TrySendError::Closed(_) => break,
+                                    mpsc::error::TrySendError::Closed(packet) => {
+                                        self.udp_packet_buffers.put(packet.packet);
+                                        break;
+                                    }
                                 }
                             }
                         }
                         Err(err) => {
+                            self.udp_packet_buffers.put(packet);
                             error!("failed to read UDP packet: {err}");
                             time::sleep(Duration::from_millis(50)).await;
                         }
@@ -238,6 +247,7 @@ impl TransparentProxy {
         mut rx: mpsc::Receiver<UdpPacket>,
     ) {
         let mut cleanup = time::interval(Duration::from_secs(5));
+        let mut send_buf = Vec::with_capacity(65535 + 32);
         loop {
             tokio::select! {
                 _ = self.shutdown_notify.notified() => {
@@ -250,7 +260,13 @@ impl TransparentProxy {
                     match work {
                         Some(work) => {
                             let this = Arc::clone(&self);
-                            this.handle_udp_packet(Arc::clone(&listener), work.packet, work.client_addr).await;
+                            this.handle_udp_packet(
+                                Arc::clone(&listener),
+                                &mut send_buf,
+                                &work.packet[..work.packet_len],
+                                work.client_addr,
+                            ).await;
+                            self.udp_packet_buffers.put(work.packet);
                         }
                         None => break,
                     }
@@ -262,7 +278,8 @@ impl TransparentProxy {
     async fn handle_udp_packet(
         self: Arc<Self>,
         listener: Arc<UdpSocket>,
-        packet: Vec<u8>,
+        send_buf: &mut Vec<u8>,
+        packet: &[u8],
         client_addr: SocketAddr,
     ) {
         let local_addr = match listener.local_addr() {
@@ -281,7 +298,7 @@ impl TransparentProxy {
             }
         };
 
-        let local_key = SocketAddr::new(dst_ip, client_addr.port()).to_string();
+        let local_key = UdpAssociationKey::new(dst_ip, client_addr.port());
         let remote_addr = SocketAddr::new(dst_ip, dst_port);
 
         let mut assoc = None;
@@ -296,6 +313,16 @@ impl TransparentProxy {
         let assoc = match assoc {
             Some(existing) => existing,
             None => {
+                self.cleanup_stale_udp_associations().await;
+                self.reap_udp_reader_handles().await;
+                if self.udp_connections.lock().await.len() >= MAX_UDP_ASSOCIATIONS {
+                    warn!(
+                        "dropping UDP packet for {} -> {} (association limit reached)",
+                        client_addr, remote_addr
+                    );
+                    return;
+                }
+
                 let assoc = match self.socks5.udp_associate().await {
                     Ok(assoc) => Arc::new(assoc),
                     Err(err) => {
@@ -315,14 +342,14 @@ impl TransparentProxy {
                     self.spawn_udp_reader(
                         Arc::clone(&assoc),
                         Arc::clone(&listener),
-                        local_key.clone(),
+                        local_key,
                         client_addr,
                         remote_addr,
                     )
                     .await;
 
                     map.insert(
-                        local_key.clone(),
+                        local_key,
                         UdpAssociationEntry {
                             assoc: Arc::clone(&assoc),
                             last_active: Instant::now(),
@@ -333,7 +360,7 @@ impl TransparentProxy {
             }
         };
 
-        if let Err(err) = assoc.send_to(&packet, remote_addr).await {
+        if let Err(err) = assoc.send_to(send_buf, packet, remote_addr).await {
             error!("failed to send UDP packet to remote host: {err}");
         }
     }
@@ -342,7 +369,7 @@ impl TransparentProxy {
         &self,
         assoc: Arc<Socks5UdpAssociation>,
         listener: Arc<UdpSocket>,
-        local_key: String,
+        local_key: UdpAssociationKey,
         client_addr: SocketAddr,
         remote_addr: SocketAddr,
     ) {
@@ -403,6 +430,33 @@ impl TransparentProxy {
         let mut map = self.udp_connections.lock().await;
         map.retain(|_, entry| now.duration_since(entry.last_active) < timeout);
     }
+
+    async fn reap_udp_reader_handles(&self) {
+        let mut handles = self.udp_reader_handles.lock().await;
+        let mut idx = 0;
+        while idx < handles.len() {
+            if handles[idx].is_finished() {
+                handles.swap_remove(idx);
+            } else {
+                idx += 1;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct UdpAssociationKey {
+    dst_ip: IpAddr,
+    client_port: u16,
+}
+
+impl UdpAssociationKey {
+    fn new(dst_ip: IpAddr, client_port: u16) -> Self {
+        Self {
+            dst_ip,
+            client_port,
+        }
+    }
 }
 
 struct UdpAssociationEntry {
@@ -412,7 +466,39 @@ struct UdpAssociationEntry {
 
 struct UdpPacket {
     packet: Vec<u8>,
+    packet_len: usize,
     client_addr: SocketAddr,
+}
+
+struct UdpPacketBufferPool {
+    buffers: StdMutex<Vec<Vec<u8>>>,
+}
+
+impl UdpPacketBufferPool {
+    fn new() -> Self {
+        Self {
+            buffers: StdMutex::new(Vec::new()),
+        }
+    }
+
+    fn take(&self) -> Vec<u8> {
+        self.buffers
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| vec![0u8; UDP_DATAGRAM_BUFFER_SIZE])
+    }
+
+    fn put(&self, mut buffer: Vec<u8>) {
+        if buffer.len() != UDP_DATAGRAM_BUFFER_SIZE {
+            buffer.resize(UDP_DATAGRAM_BUFFER_SIZE, 0);
+        }
+
+        let mut buffers = self.buffers.lock().unwrap();
+        if buffers.len() < UDP_PACKET_POOL_MAX {
+            buffers.push(buffer);
+        }
+    }
 }
 
 fn bind_dual_stack_tcp(port: u16) -> io::Result<TcpListener> {

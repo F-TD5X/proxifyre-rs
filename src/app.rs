@@ -3,6 +3,7 @@ use crate::router::SocksLocalRouter;
 use crate::tui::Tui;
 use crate::windows::stats::WindowsSystemStats;
 use anyhow::{Context, Result};
+use std::collections::VecDeque;
 use std::fs;
 use std::sync::Arc;
 use std::thread;
@@ -13,7 +14,7 @@ pub async fn run() -> Result<()> {
     let local = LocalSet::new();
     local
         .run_until(async {
-            let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let logs = Arc::new(std::sync::Mutex::new(VecDeque::new()));
             crate::logging::init(Arc::clone(&logs))
                 .map_err(|err| anyhow::anyhow!("failed to initialize logger: {err}"))?;
             log::info!("Starting...");

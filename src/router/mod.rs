@@ -25,7 +25,7 @@ use self::adapter::{run_packet_loop, select_best_adapter_name};
 use self::filters::{
     build_icmp_pass_filter, build_proxy_pass_filters, build_proxy_pass_filters_v6,
 };
-use self::flow::{TcpPortMapping, UdpPortMapping, normalize_mapped_ipv6};
+use self::flow::{TcpPortMapping, UdpFlowKey, UdpIndexKey, UdpPortMapping, normalize_mapped_ipv6};
 
 const DRIVER_NAME: &str = "NDISRD";
 const MAX_STATIC_FILTERS: usize = 256;
@@ -35,8 +35,7 @@ pub struct SocksLocalRouter {
     process_lookup: Arc<dyn ProcessLookup>,
     #[allow(clippy::type_complexity)]
     tcp_connections: Arc<Mutex<HashMap<(IpAddr, IpAddr, u16), TcpPortMapping>>>,
-    #[allow(clippy::type_complexity)]
-    udp_endpoints: Arc<Mutex<HashMap<(IpAddr, IpAddr, u16), UdpPortMapping>>>,
+    udp_endpoints: Arc<Mutex<UdpMappings>>,
     proxies: Arc<Mutex<Vec<Arc<TransparentProxy>>>>,
     name_to_proxy: Arc<Mutex<HashMap<String, usize>>>,
     static_filters: Arc<Mutex<Vec<StaticFilter>>>,
@@ -64,7 +63,7 @@ impl SocksLocalRouter {
             adapter_name: Arc::new(Mutex::new(adapter_name)),
             process_lookup: Arc::new(WindowsProcessLookup::new()),
             tcp_connections: Arc::new(Mutex::new(HashMap::new())),
-            udp_endpoints: Arc::new(Mutex::new(HashMap::new())),
+            udp_endpoints: Arc::new(Mutex::new(UdpMappings::new())),
             proxies: Arc::new(Mutex::new(Vec::new())),
             name_to_proxy: Arc::new(Mutex::new(HashMap::new())),
             static_filters: Arc::new(Mutex::new(filters)),
@@ -119,9 +118,10 @@ impl SocksLocalRouter {
             let local = normalize_mapped_ipv6(local);
             let map = udp_map.lock().unwrap();
             let local_ip = local.ip();
-            let key = (peer.ip(), local_ip, peer.port());
+            let key = UdpFlowKey::new(peer.ip(), local_ip, peer.port());
             if !local_ip.is_unspecified() {
                 return map
+                    .by_flow
                     .get(&key)
                     .map(|entry| (entry.dst_ip, entry.dst_port))
                     .ok_or_else(|| {
@@ -132,27 +132,26 @@ impl SocksLocalRouter {
                     });
             }
 
-            let mut match_entry = None;
-            for ((dst_ip, _src_ip, src_port), entry) in map.iter() {
-                if *dst_ip == peer.ip() && *src_port == peer.port() {
-                    if match_entry.is_some() {
-                        return Err(std::io::Error::new(
+            match map.by_peer.get(&UdpIndexKey::new(peer.ip(), peer.port())) {
+                Some(Some(key)) => map
+                    .by_flow
+                    .get(key)
+                    .map(|entry| (entry.dst_ip, entry.dst_port))
+                    .ok_or_else(|| {
+                        std::io::Error::new(
                             std::io::ErrorKind::NotFound,
-                            "ambiguous destination mapping",
-                        ));
-                    }
-                    match_entry = Some(entry);
-                }
+                            "original destination not found",
+                        )
+                    }),
+                Some(None) => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "ambiguous destination mapping",
+                )),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "original destination not found",
+                )),
             }
-
-            match_entry
-                .map(|entry| (entry.dst_ip, entry.dst_port))
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "original destination not found",
-                    )
-                })
         });
 
         let proxy = Arc::new(TransparentProxy::new(0, dialer, query_tcp, query_udp));
@@ -345,7 +344,7 @@ impl SocksLocalRouter {
     }
 
     pub fn get_udp_connection_count(&self) -> usize {
-        self.udp_endpoints.lock().unwrap().len()
+        self.udp_endpoints.lock().unwrap().by_flow.len()
     }
 
     pub fn get_bytes_sent(&self) -> u64 {
@@ -358,6 +357,123 @@ impl SocksLocalRouter {
 
     pub fn get_running_time(&self) -> std::time::Duration {
         self.start_time.elapsed()
+    }
+}
+
+struct UdpMappings {
+    by_flow: HashMap<UdpFlowKey, UdpPortMapping>,
+    by_peer: HashMap<UdpIndexKey, Option<UdpFlowKey>>,
+}
+
+impl UdpMappings {
+    fn new() -> Self {
+        Self {
+            by_flow: HashMap::new(),
+            by_peer: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, key: UdpFlowKey, entry: UdpPortMapping) {
+        let existing = self.by_flow.contains_key(&key);
+        self.by_flow.insert(key, entry);
+        if !existing {
+            self.insert_peer_index(key);
+        }
+    }
+
+    fn retain_active(&mut self, mut keep: impl FnMut(&UdpPortMapping) -> bool) {
+        self.by_flow.retain(|_, entry| keep(entry));
+        self.rebuild_peer_index();
+    }
+
+    fn rebuild_peer_index(&mut self) {
+        self.by_peer.clear();
+        let by_peer = &mut self.by_peer;
+        for key in self.by_flow.keys().copied() {
+            insert_peer_index(by_peer, key);
+        }
+    }
+
+    fn insert_peer_index(&mut self, key: UdpFlowKey) {
+        insert_peer_index(&mut self.by_peer, key);
+    }
+}
+
+fn insert_peer_index(by_peer: &mut HashMap<UdpIndexKey, Option<UdpFlowKey>>, key: UdpFlowKey) {
+    let index_key = UdpIndexKey::new(key.dst_ip, key.src_port);
+    by_peer
+        .entry(index_key)
+        .and_modify(|entry| {
+            if *entry != Some(key) {
+                *entry = None;
+            }
+        })
+        .or_insert(Some(key));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+    use std::time::Instant;
+
+    fn udp_entry(dst_ip: IpAddr, dst_port: u16) -> UdpPortMapping {
+        UdpPortMapping {
+            dst_ip,
+            dst_port,
+            proxy_port: 10000,
+            last_active: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn udp_peer_index_tracks_unique_mapping() {
+        let dst = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let src = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let key = UdpFlowKey::new(dst, src, 53000);
+        let mut mappings = UdpMappings::new();
+
+        mappings.insert(key, udp_entry(dst, 53));
+
+        assert_eq!(
+            mappings.by_peer.get(&UdpIndexKey::new(dst, 53000)),
+            Some(&Some(key))
+        );
+    }
+
+    #[test]
+    fn udp_peer_index_marks_ambiguous_mapping() {
+        let dst = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let src_a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let src_b = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
+        let mut mappings = UdpMappings::new();
+
+        mappings.insert(UdpFlowKey::new(dst, src_a, 53000), udp_entry(dst, 53));
+        mappings.insert(UdpFlowKey::new(dst, src_b, 53000), udp_entry(dst, 53));
+
+        assert_eq!(
+            mappings.by_peer.get(&UdpIndexKey::new(dst, 53000)),
+            Some(&None)
+        );
+    }
+
+    #[test]
+    fn udp_peer_index_rebuilds_after_cleanup() {
+        let dst = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let src_a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let src_b = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
+        let key_a = UdpFlowKey::new(dst, src_a, 53000);
+        let key_b = UdpFlowKey::new(dst, src_b, 53000);
+        let mut mappings = UdpMappings::new();
+
+        mappings.insert(key_a, udp_entry(dst, 53));
+        mappings.insert(key_b, udp_entry(dst, 123));
+        mappings.retain_active(|entry| entry.dst_port == 53);
+
+        assert_eq!(
+            mappings.by_peer.get(&UdpIndexKey::new(dst, 53000)),
+            Some(&Some(key_a))
+        );
     }
 }
 

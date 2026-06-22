@@ -1,5 +1,6 @@
 use chrono::{Local, SecondsFormat};
 use log::{LevelFilter, Log, Metadata, Record, SetLoggerError};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
@@ -8,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 const MAX_LOG_LINES: usize = 50;
 
 struct TuiLogger {
-    logs: Arc<Mutex<Vec<String>>>,
+    logs: Arc<Mutex<VecDeque<String>>>,
     log_file: Mutex<Option<File>>,
 }
 
@@ -25,10 +26,10 @@ impl Log for TuiLogger {
         let line = format!("[{}] [{:>5}] {}", now, record.level(), record.args());
 
         let mut logs = self.logs.lock().unwrap();
-        logs.push(line.clone());
+        logs.push_back(line.clone());
 
         if logs.len() > MAX_LOG_LINES {
-            logs.remove(0);
+            logs.pop_front();
         }
 
         if let Some(ref mut file) = *self.log_file.lock().unwrap() {
@@ -60,7 +61,7 @@ fn get_executable_dir() -> Option<PathBuf> {
     }
 }
 
-pub fn init(logs: Arc<Mutex<Vec<String>>>) -> Result<(), SetLoggerError> {
+pub fn init(logs: Arc<Mutex<VecDeque<String>>>) -> Result<(), SetLoggerError> {
     if LOGGER.get().is_some() {
         return Ok(());
     }

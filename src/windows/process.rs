@@ -226,36 +226,32 @@ impl WindowsProcessLookup {
 
     fn refresh_tcp_v4_cache(&self) -> Option<()> {
         let table = get_tcp_table(AF_INET.0 as u32, TCP_TABLE_OWNER_PID_ALL).ok()?;
-        let map = build_tcp_v4_map(&table);
         let mut cache = self.session_cache.lock().unwrap();
-        cache.tcp_v4 = map;
+        rebuild_tcp_v4_map(&table, &mut cache.tcp_v4);
         cache.tcp_v4_last_refresh = Some(Instant::now());
         Some(())
     }
 
     fn refresh_tcp_v6_cache(&self) -> Option<()> {
         let table = get_tcp_table(AF_INET6.0 as u32, TCP_TABLE_OWNER_PID_ALL).ok()?;
-        let map = build_tcp_v6_map(&table);
         let mut cache = self.session_cache.lock().unwrap();
-        cache.tcp_v6 = map;
+        rebuild_tcp_v6_map(&table, &mut cache.tcp_v6);
         cache.tcp_v6_last_refresh = Some(Instant::now());
         Some(())
     }
 
     fn refresh_udp_v4_cache(&self) -> Option<()> {
         let table = get_udp_table(AF_INET.0 as u32, UDP_TABLE_OWNER_PID).ok()?;
-        let map = build_udp_v4_map(&table);
         let mut cache = self.session_cache.lock().unwrap();
-        cache.udp_v4 = map;
+        rebuild_udp_v4_map(&table, &mut cache.udp_v4);
         cache.udp_v4_last_refresh = Some(Instant::now());
         Some(())
     }
 
     fn refresh_udp_v6_cache(&self) -> Option<()> {
         let table = get_udp_table(AF_INET6.0 as u32, UDP_TABLE_OWNER_PID).ok()?;
-        let map = build_udp_v6_map(&table);
         let mut cache = self.session_cache.lock().unwrap();
-        cache.udp_v6 = map;
+        rebuild_udp_v6_map(&table, &mut cache.udp_v6);
         cache.udp_v6_last_refresh = Some(Instant::now());
         Some(())
     }
@@ -276,11 +272,12 @@ impl ProcessLookup for WindowsProcessLookup {
     }
 }
 
-fn build_tcp_v4_map(table: &[u8]) -> HashMap<TcpKeyV4, u32> {
+fn rebuild_tcp_v4_map(table: &[u8], map: &mut HashMap<TcpKeyV4, u32>) {
     let table = unsafe { &*(table.as_ptr() as *const MIB_TCPTABLE_OWNER_PID) };
     let entries = table.dwNumEntries as usize;
     let rows = table.table.as_ptr();
-    let mut map = HashMap::with_capacity(entries);
+    map.clear();
+    map.reserve(entries);
 
     for i in 0..entries {
         let row = unsafe { &*rows.add(i) };
@@ -292,8 +289,6 @@ fn build_tcp_v4_map(table: &[u8]) -> HashMap<TcpKeyV4, u32> {
         );
         map.insert(key, row.dwOwningPid);
     }
-
-    map
 }
 
 fn is_stale(last_refresh: Option<Instant>) -> bool {
@@ -303,11 +298,12 @@ fn is_stale(last_refresh: Option<Instant>) -> bool {
     }
 }
 
-fn build_tcp_v6_map(table: &[u8]) -> HashMap<TcpKeyV6, u32> {
+fn rebuild_tcp_v6_map(table: &[u8], map: &mut HashMap<TcpKeyV6, u32>) {
     let table = unsafe { &*(table.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID) };
     let entries = table.dwNumEntries as usize;
     let rows = table.table.as_ptr();
-    let mut map = HashMap::with_capacity(entries);
+    map.clear();
+    map.reserve(entries);
 
     for i in 0..entries {
         let row = unsafe { &*rows.add(i) };
@@ -319,15 +315,14 @@ fn build_tcp_v6_map(table: &[u8]) -> HashMap<TcpKeyV6, u32> {
         );
         map.insert(key, row.dwOwningPid);
     }
-
-    map
 }
 
-fn build_udp_v4_map(table: &[u8]) -> HashMap<UdpKeyV4, u32> {
+fn rebuild_udp_v4_map(table: &[u8], map: &mut HashMap<UdpKeyV4, u32>) {
     let table = unsafe { &*(table.as_ptr() as *const MIB_UDPTABLE_OWNER_PID) };
     let entries = table.dwNumEntries as usize;
     let rows = table.table.as_ptr();
-    let mut map = HashMap::with_capacity(entries);
+    map.clear();
+    map.reserve(entries);
 
     for i in 0..entries {
         let row = unsafe { &*rows.add(i) };
@@ -337,15 +332,14 @@ fn build_udp_v4_map(table: &[u8]) -> HashMap<UdpKeyV4, u32> {
         );
         map.insert(key, row.dwOwningPid);
     }
-
-    map
 }
 
-fn build_udp_v6_map(table: &[u8]) -> HashMap<UdpKeyV6, u32> {
+fn rebuild_udp_v6_map(table: &[u8], map: &mut HashMap<UdpKeyV6, u32>) {
     let table = unsafe { &*(table.as_ptr() as *const MIB_UDP6TABLE_OWNER_PID) };
     let entries = table.dwNumEntries as usize;
     let rows = table.table.as_ptr();
-    let mut map = HashMap::with_capacity(entries);
+    map.clear();
+    map.reserve(entries);
 
     for i in 0..entries {
         let row = unsafe { &*rows.add(i) };
@@ -355,8 +349,6 @@ fn build_udp_v6_map(table: &[u8]) -> HashMap<UdpKeyV6, u32> {
         );
         map.insert(key, row.dwOwningPid);
     }
-
-    map
 }
 
 fn get_tcp_table(af: u32, class: TCP_TABLE_CLASS) -> Result<Vec<u8>> {
